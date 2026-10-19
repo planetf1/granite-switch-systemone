@@ -552,3 +552,22 @@ def test_run_until_disconnect_returns_the_result_when_the_client_stays():
         return "answer"
 
     assert asyncio.run(sp._run_until_disconnect(_Request(), work())) == "answer"
+
+
+def test_choice_without_descriptions_renders_its_option_keys(monkeypatch):
+    """With no description an option must still say what it is: rendering only its
+    label made the answer depend on list order (live: one option scored 0.809 first
+    and 0.066 third on the same text)."""
+    seen = {}
+
+    def renderer(tok, state, instructions, descs):
+        seen["descs"] = descs
+        return [], list(range(len(descs)))
+
+    async def fake_fetch(chat, served_model, adapter_name, msgs, label_ids_chunk):
+        return _fake_chat_response(label_ids_chunk, 10, None, None)
+
+    monkeypatch.setattr(sp, "_fetch_label_logprobs", fake_fetch)
+    q = sp.Question(type="choice", instructions="Which?", criteria={"refund request": None, "login": "Login problems"})
+    asyncio.run(sp._answer_question("q", q, "state", None, None, "m", "decision", renderer))
+    assert seen["descs"] == ["refund request", "Login problems"]

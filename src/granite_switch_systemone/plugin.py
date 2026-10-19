@@ -682,7 +682,8 @@ async def _answer_question(
     """Returns (name, jev-shaped answer dict, this question's TokenUsage)."""
     if q.type == "choice":
         keys = list(q.criteria)
-        descs = [q.criteria[k] for k in keys]
+        # An option without a description is described by its key, as vLLM's native strategy does.
+        descs = [k if q.criteria[k] in (None, "") else q.criteria[k] for k in keys]
     elif q.type == "noul":
         crit = q.criteria if isinstance(q.criteria, dict) else {}
         keys = ["false", "true"]
