@@ -176,6 +176,27 @@ Deliberate scope limits on this route:
   route shadows it under vLLM's documented endpoint-plugin precedence — strictly better
   here, since the native route rejects GraniteSwitch architectures.
 
+## Testing against a live server
+
+`scripts/e2e_check.py` runs the full wire-format battery against any deployment of this
+container — both routes' answer shapes, cross-route parity, input flattening, boolean
+value round-tripping, error shapes, usage, and that `/v1/chat/completions` still works
+on the shared server. It uses only the Python standard library, so it runs wherever
+Python does:
+
+```bash
+python3 scripts/e2e_check.py --base-url http://localhost:8000
+```
+
+Pass `--model` to skip model discovery, `--skip-chat` on servers without chat, and
+`--tolerance` to loosen the cross-route parity bound (default 1e-6; the two routes
+render byte-identical prompts, but GPU batching can shift low-order bits between
+separate requests). Exit code 0 means every check passed.
+
+Deployment is deliberately out of scope: whatever brings the server up — a local
+container, a cluster job — only needs to hand the script its base URL, so any
+site-specific deployment automation can live outside this repo.
+
 ## Deliberate scope limits (not a proxy to typesafe.ai)
 
 - `model` is required on the request (schema compliance) but never validated — the
