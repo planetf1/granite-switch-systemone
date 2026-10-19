@@ -11,9 +11,11 @@ two decision APIs, on the same server and GPU cache as `/v1/chat/completions`:
 Each question is answered by one engine read of the adapter's single-token option labels,
 returned as calibrated probabilities. Callers need no prompt format, marker or label scheme.
 
+What has and has not been tested is in [docs/STATUS.md](docs/STATUS.md).
+
 ## Install
 
-### Docker (recommended)
+### Docker
 
 ```bash
 docker build --platform linux/amd64 -t granite-switch-systemone .
@@ -24,7 +26,8 @@ docker run -d --gpus all -p 8000:8000 \
 
 The image is `vllm/vllm-openai:v0.26.0-cu129` plus `granite-switch[vllm]==0.1.1`,
 `transformers==5.17.0` and this plugin. Weights are not baked in: mount a downloaded
-checkpoint at `/repository`, or set `MODEL_DIR`. No image is published yet.
+checkpoint at `/repository`, or set `MODEL_DIR`. No image is published yet, and the image
+has not been tested (see [docs/STATUS.md](docs/STATUS.md)); the install below has.
 
 ### Into an existing vLLM environment
 
