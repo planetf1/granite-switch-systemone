@@ -27,6 +27,14 @@ Exit code 0 means every check passed. Checks:
                       systemone route
   chat                /v1/chat/completions still works on the shared server
                       (skip with --skip-chat)
+  prefix_cache        vLLM's prefix-cache hit counter (GET /metrics) for a
+                      decision after a chat or a decision about the same
+                      state: hits when the chat's first turn is the
+                      `State:` turn and for a second decision, none when the
+                      chat sends the raw state (skip with --skip-prefix-cache;
+                      also skipped with --skip-chat). The counters are
+                      server-wide, so run it on a server with no other
+                      traffic.
 
 Parity tolerance defaults to 1e-6: the two routes render byte-identical
 prompts, but GPU batching can shift low-order bits between separate requests,
@@ -37,9 +45,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import time
 import urllib.error
 import urllib.request
+import uuid
 
 STATE = "My payouts have failed three times. The bank says everything is fine."
 
@@ -48,6 +59,7 @@ class Check:
     def __init__(self, name: str) -> None:
         self.name = name
         self.failures: list[str] = []
+        self.notes: list[str] = []
 
     def expect(self, condition: bool, message: str) -> None:
         if not condition:
@@ -84,6 +96,13 @@ class Client:
 
     def get(self, path: str) -> tuple[int, dict]:
         return self.request("GET", path)
+
+    def get_text(self, path: str) -> tuple[int, str]:
+        try:
+            with urllib.request.urlopen(f"{self.base_url}{path}", timeout=self.timeout) as resp:
+                return resp.status, resp.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
 
 
 DECISIONS_BODY = {
@@ -338,6 +357,102 @@ def check_chat(client: Client, model: str) -> Check:
     return check
 
 
+# vLLM's prefix-cache counters, in tokens; prometheus_client appends `_total` to counters.
+PREFIX_CACHE_COUNTERS = {"vllm:prefix_cache_queries_total": "queries", "vllm:prefix_cache_hits_total": "hits"}
+METRIC_LINE = re.compile(r"^(?P<name>[^{\s]+)(?:\{.*\})?\s+(?P<value>\S+)")
+TICKET = (
+    "My payouts to the business account have failed three times this month. The bank says nothing "
+    "is wrong on their side and the account details are correct. Each failure arrived as an email "
+    "with no reason code, and support has not replied. I have payroll due on Friday. "
+)
+
+
+def prefix_cache_counters(client: Client) -> dict[str, float] | None:
+    """Prefix-cache queries and hits summed over engines, or None when /metrics does not
+    expose them (stats disabled with --disable-log-stats, or not a vLLM server)."""
+    status, text = client.get_text("/metrics")
+    if status != 200:
+        return None
+    totals = {"queries": 0.0, "hits": 0.0}
+    found = False
+    for line in text.splitlines():
+        match = METRIC_LINE.match(line)
+        if match and match["name"] in PREFIX_CACHE_COUNTERS:
+            totals[PREFIX_CACHE_COUNTERS[match["name"]]] += float(match["value"])
+            found = True
+    return totals if found else None
+
+
+def cache_hits(client: Client, path: str, body: dict) -> tuple[float | None, dict]:
+    """POST one request and return the prefix-cache hit tokens it added, with its body.
+    The engine reports stats on its own loop, which can trail the HTTP response, so poll
+    until the query counter moves. None means it never moved: prefix caching is off."""
+    before = prefix_cache_counters(client)
+    _, response = client.post(path, body)
+    for _ in range(50):
+        after = prefix_cache_counters(client)
+        if before is not None and after is not None and after["queries"] > before["queries"]:
+            return after["hits"] - before["hits"], response
+        time.sleep(0.1)
+    return None, response
+
+
+def check_prefix_cache(client: Client, model: str) -> Check:
+    check = Check("prefix_cache")
+    if prefix_cache_counters(client) is None:
+        check.expect(False, "GET /metrics has no vllm:prefix_cache_* counters (log stats disabled?)")
+        return check
+
+    def state() -> str:
+        # A fresh state per probe, unique from its first block, so no earlier request
+        # (this run's or a previous one's) can supply a hit.
+        return f"Ticket {uuid.uuid4().hex}. " + TICKET * 6
+
+    def decision(text: str, question: str) -> dict:
+        return {
+            "model": model,
+            "input": text,
+            "questions": [{"type": "predicate", "name": "q", "instructions": question}],
+        }
+
+    def chat(messages: list[dict]) -> dict:
+        return {"model": model, "messages": messages, "max_tokens": 1}
+
+    def probe(label: str, setup: tuple[str, dict], text: str, expect_hits: bool) -> None:
+        cache_hits(client, *setup)
+        hits, response = cache_hits(client, "/v1/decisions", decision(text, "Does this need urgent attention?"))
+        if hits is None:
+            check.expect(False, f"{label}: prefix-cache query counter never moved (prefix caching disabled?)")
+            return
+        prompt = response.get("usage", {}).get("input_tokens", 0)
+        check.notes.append(f"{label}: {hits:.0f} of {prompt} decision prompt tokens from cache")
+        if expect_hits:
+            # The state turn is most of the decision prompt; the decision turn is the rest.
+            check.expect(hits >= prompt / 2, f"{label}: expected at least half the prompt from cache")
+        else:
+            check.expect(hits == 0, f"{label}: expected no full block in common")
+
+    text = state()
+    probe(
+        "after a decision about the same state",
+        ("/v1/decisions", decision(text, "Is the customer angry?")),
+        text,
+        True,
+    )
+    text = state()
+    shared_layout = [
+        {"role": "user", "content": "State:\n" + text},
+        {"role": "user", "content": "Summarise this ticket in one sentence."},
+    ]
+    probe(
+        "after a chat whose first turn is `State:` + state", ("/v1/chat/completions", chat(shared_layout)), text, True
+    )
+    text = state()
+    raw = [{"role": "user", "content": text}]
+    probe("after a chat sending the raw state", ("/v1/chat/completions", chat(raw)), text, False)
+    return check
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--base-url", required=True, help="server base URL, e.g. http://host:8000")
@@ -345,6 +460,7 @@ def main() -> int:
     parser.add_argument("--tolerance", type=float, default=1e-6, help="parity tolerance")
     parser.add_argument("--timeout", type=float, default=120.0, help="per-request timeout seconds")
     parser.add_argument("--skip-chat", action="store_true", help="skip the chat-completions check")
+    parser.add_argument("--skip-prefix-cache", action="store_true", help="skip the prefix-cache check")
     args = parser.parse_args()
 
     client = Client(args.base_url, args.timeout)
@@ -370,6 +486,8 @@ def main() -> int:
     ]
     if not args.skip_chat:
         checks.append(check_chat(client, model))
+        if not args.skip_prefix_cache:
+            checks.append(check_prefix_cache(client, model))
 
     failed = 0
     for check in checks:
@@ -380,6 +498,8 @@ def main() -> int:
                 print(f"     {failure}")
         else:
             print(f"PASS {check.name}")
+        for note in check.notes:
+            print(f"     {note}")
     print(f"\n{len(checks) - failed}/{len(checks)} checks passed")
     return 1 if failed else 0
 
