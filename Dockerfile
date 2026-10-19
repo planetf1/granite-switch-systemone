@@ -53,6 +53,8 @@ RUN chmod +x /usr/local/bin/serve.sh
 # other vLLM plugin groups, which default to "load everything" when VLLM_PLUGINS is
 # unset): must include register_granite_switch too, or the Switch model class stops
 # being registered the moment this allowlist is set at all.
-ENV VLLM_PLUGINS=register_granite_switch,granite_switch_systemone
+ENV VLLM_PLUGINS=register_granite_switch,granite_switch_systemone \
+    SYSTEMONE_ADAPTER_NAME=decision \
+    SYSTEMONE_INVOCATION_MARKER="### DECISION"
 EXPOSE 8000
 ENTRYPOINT ["/usr/local/bin/serve.sh"]

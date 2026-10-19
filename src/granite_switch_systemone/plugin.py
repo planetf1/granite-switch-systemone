@@ -94,6 +94,7 @@ if TYPE_CHECKING:
 _RENDERER_ENV = "SYSTEMONE_RENDERER"
 _DEFAULT_RENDERER = "granite_switch_systemone.renderer:render"
 _ADAPTER_NAME_ENV = "SYSTEMONE_ADAPTER_NAME"
+_DEFAULT_ADAPTER_NAME = "decision"
 
 # jev: request body <= 32 MiB.
 MAX_BODY_BYTES = 32 * 1024 * 1024
@@ -131,20 +132,10 @@ def _load_renderer():
 
 
 def _resolve_adapter_name(chat) -> str:
-    """Which `adapter_name` activates the decision adapter on THIS loaded checkpoint.
-    Cross-checked against the real `GraniteSwitchConfig.adapter_names` vLLM already
-    has in memory for this request (`chat.model_config.hf_config.adapter_names`) --
-    never assumed, never guessed from a hardcoded name list. `SYSTEMONE_ADAPTER_NAME`
-    always wins if set, still validated against the same list, so a typo'd override
-    fails loudly at startup. If unset and the checkpoint has EXACTLY one adapter, that
-    one is used automatically (the common single-decision-adapter deployment); with
-    zero or more than one adapter, the env var is required -- there is no safe guess.
-
-    Getting this wrong is NOT a cosmetic bug: when `chat_template_kwargs.adapter_name`
-    names an adapter absent from the checkpoint's chat-template `adapter_map`,
-    granite-switch's Jinja template silently activates NO adapter at all -- no error,
-    no control token, just a request that runs on plain base Granite with zero
-    decision-adapter calibration."""
+    """The decision adapter's name, checked against the checkpoint's own adapter list:
+    `SYSTEMONE_ADAPTER_NAME` if set, else the only adapter, else one named `decision`.
+    A wrong name must fail startup: the chat template silently activates no adapter
+    for a name it does not know."""
     adapter_names = getattr(chat.model_config.hf_config, "adapter_names", None) or []
     override = os.environ.get(_ADAPTER_NAME_ENV)
     if override:
@@ -155,11 +146,11 @@ def _resolve_adapter_name(chat) -> str:
         )
     if len(adapter_names) == 1:
         return adapter_names[0]
+    if _DEFAULT_ADAPTER_NAME in adapter_names:
+        return _DEFAULT_ADAPTER_NAME
     raise RuntimeError(
-        f"{_ADAPTER_NAME_ENV} is not set, and this checkpoint has "
-        f"{len(adapter_names)} adapters {adapter_names!r} (auto-resolution only "
-        f"applies with exactly one) -- set {_ADAPTER_NAME_ENV} to the decision "
-        "adapter's name."
+        f"{_ADAPTER_NAME_ENV} is not set, and this checkpoint's adapters {adapter_names!r} "
+        f"include no {_DEFAULT_ADAPTER_NAME!r} -- set {_ADAPTER_NAME_ENV} to the decision adapter's name."
     )
 
 

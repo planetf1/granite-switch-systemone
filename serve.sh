@@ -1,30 +1,21 @@
 #!/bin/bash
-# vLLM's OpenAI-compatible server (/v1/chat/completions, /v1/completions, /health) for a
-# composed granite-switch checkpoint at $MODEL_DIR, plus the jev system-one API
-# (/v1/systemone) mounted on the SAME server via vLLM's own `vllm.endpoint_plugins`
-# mechanism -- `vllm serve` discovers and mounts it on its own; nothing below invokes it
-# directly. Override with the env vars below, and pass extra `vllm serve` flags as
-# container arguments.
-#   MODEL_DIR               default: /repository (HF Inference Endpoints' own mount point;
-#                           override for any other deployment target)
+# vLLM's OpenAI-compatible server for a composed granite-switch checkpoint at $MODEL_DIR,
+# with /v1/decisions and /v1/systemone mounted by the endpoint plugin. Extra container
+# arguments are passed to `vllm serve`.
+#   MODEL_DIR               default /repository (HF Inference Endpoints' mount point)
 #   TENSOR_PARALLEL_SIZE    default: every visible GPU
 #   MAX_MODEL_LEN (32768), GPU_MEMORY_UTILIZATION (0.90), PORT (8000), SERVED_MODEL_NAME
-#   VLLM_PLUGINS            default (set in the Dockerfile): register_granite_switch,
-#                           granite_switch_systemone -- BOTH names are required (see
-#                           Dockerfile comment); drop the second to disable /v1/systemone.
-#   SYSTEMONE_ADAPTER_NAME, SYSTEMONE_INVOCATION_MARKER, SYSTEMONE_RENDERER
-#                           see src/granite_switch_systemone/plugin.py and renderer.py.
+#   SYSTEMONE_ADAPTER_NAME  default "decision"; SYSTEMONE_INVOCATION_MARKER, see README
 set -e
 MODEL_DIR=${MODEL_DIR:-/repository}
 TP=${TENSOR_PARALLEL_SIZE:-$(python3 -c "import torch; print(max(torch.cuda.device_count(), 1))")}
-# --enable-prompt-tokens-details: vLLM reports each request's prefix-cache hits, which
-# /v1/decisions returns as usage.input_tokens_details.cached_tokens (0 without it).
-# FlashAttention 2: granite-switch's FA3 ahead-of-time schedule is sized from the model
-# config rather than the Switch's own attention layers, and CUDA-graph capture fails
-# (generative-computing/granite-switch#139, open as of this writing).
-# bfloat16: composed checkpoints carry torch_dtype: null
-# (generative-computing/granite-switch#126, open as of this writing), which vLLM would
-# otherwise resolve to float32.
+export SYSTEMONE_ADAPTER_NAME=${SYSTEMONE_ADAPTER_NAME:-decision}
+# --dtype bfloat16: composed checkpoints carry torch_dtype null (granite-switch#126).
+# flash_attn_version=2: avoids the FA3 schedule bug (granite-switch#139, still open).
+# --max-logprobs 256: lets chat clients that read labels by top-K ask for more than 20.
+# --enable-prompt-tokens-details: reports prefix-cache hits in usage.input_tokens_details.
+# No global temperature override: the plugin sends temperature 0 on every decision
+# request, and chat clients keep the model's own default.
 exec vllm serve "$MODEL_DIR" \
     --served-model-name "${SERVED_MODEL_NAME:-granite-switch}" \
     --host 0.0.0.0 --port "${PORT:-8000}" \
@@ -35,6 +26,5 @@ exec vllm serve "$MODEL_DIR" \
     --attention-config.flash_attn_version=2 \
     --max-logprobs 256 \
     --enable-prompt-tokens-details \
-    --override-generation-config '{"temperature": 0.0}' \
     --enable-auto-tool-choice --tool-call-parser granite4 \
     "$@"

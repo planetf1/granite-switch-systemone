@@ -323,8 +323,16 @@ def test_resolve_adapter_name_auto_resolves_single_adapter():
     assert sp._resolve_adapter_name(chat) == "decision"
 
 
-def test_resolve_adapter_name_requires_env_var_with_multiple_adapters():
+def test_resolve_adapter_name_prefers_decision_among_several(monkeypatch):
+    """The released Switch checkpoints carry guardian-core and decision."""
+    monkeypatch.delenv("SYSTEMONE_ADAPTER_NAME", raising=False)
     chat = _FakeChat(["guardian-core", "decision"])
+    assert sp._resolve_adapter_name(chat) == "decision"
+
+
+def test_resolve_adapter_name_requires_env_var_with_several_and_no_decision(monkeypatch):
+    monkeypatch.delenv("SYSTEMONE_ADAPTER_NAME", raising=False)
+    chat = _FakeChat(["guardian-core", "classifier"])
     with pytest.raises(RuntimeError, match="SYSTEMONE_ADAPTER_NAME"):
         sp._resolve_adapter_name(chat)
 
