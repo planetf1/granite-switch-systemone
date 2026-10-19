@@ -516,3 +516,39 @@ def test_enforce_context_limits_counts_score_level_descriptions():
     q = sp.Question(type="score", instructions="How?", criteria=["lorem " * 4000] * 10)
     with pytest.raises(ValueError):
         sp._enforce_context_limits(tok, 32768, False, "short state", {"q": q})
+
+
+def test_run_until_disconnect_cancels_work_when_the_client_leaves():
+    """A client that disconnects mid-request must cancel the in-flight engine work
+    (live: a dropped 40-question request kept prefilling for 30+ s)."""
+    cancelled = asyncio.Event()
+
+    async def work():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    class _Request:
+        async def receive(self):
+            await asyncio.sleep(0.01)
+            return {"type": "http.disconnect"}
+
+    async def run():
+        result = await sp._run_until_disconnect(_Request(), work())
+        return result, cancelled.is_set()
+
+    result, was_cancelled = asyncio.run(run())
+    assert result is None and was_cancelled
+
+
+def test_run_until_disconnect_returns_the_result_when_the_client_stays():
+    class _Request:
+        async def receive(self):
+            await asyncio.sleep(30)
+
+    async def work():
+        return "answer"
+
+    assert asyncio.run(sp._run_until_disconnect(_Request(), work())) == "answer"

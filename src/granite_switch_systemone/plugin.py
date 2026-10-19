@@ -81,7 +81,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
@@ -736,6 +736,49 @@ async def _answer_question(
     return name, answer, usage
 
 
+async def _run_until_disconnect(request: Request, work):
+    """Await `work`, cancelling it if the client disconnects first (returns None then).
+    Same pattern as vLLM's `with_cancellation`, started after the body has been read."""
+
+    async def disconnected() -> None:
+        while (await request.receive())["type"] != "http.disconnect":
+            pass
+
+    work_task = asyncio.ensure_future(work)
+    watch_task = asyncio.ensure_future(disconnected())
+    done, _ = await asyncio.wait([work_task, watch_task], return_when=asyncio.FIRST_COMPLETED)
+    if work_task in done:
+        watch_task.cancel()
+        return work_task.result()
+    work_task.cancel()
+    await asyncio.gather(work_task, return_exceptions=True)
+    return None
+
+
+async def _answer_all(state, state_value: Any, questions: list[tuple[str, Question]]) -> list:
+    """Answer every question concurrently; if one fails, cancel the rest and re-raise."""
+    tasks = [
+        asyncio.ensure_future(
+            _answer_question(
+                key,
+                q,
+                state_value,
+                state.systemone_chat,
+                state.systemone_tokenizer,
+                state.systemone_served_model,
+                state.systemone_adapter_name,
+                state.systemone_renderer,
+            )
+        )
+        for key, q in questions
+    ]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        await _cancel_pending(tasks)
+        raise
+
+
 async def _cancel_pending(tasks: list[asyncio.Task]) -> None:
     """Cancel every task that hasn't finished yet, then wait for the cancellation to
     actually be processed by the event loop -- a bare `.cancel()` only *requests*
@@ -837,7 +880,7 @@ def _internal_answer_to_decisions(
     }
 
 
-async def _handle_systemone(raw_request: Request) -> JSONResponse:
+async def _handle_systemone(raw_request: Request) -> Response:
     state = raw_request.app.state
     chat = getattr(state, "systemone_chat", None)
     if chat is None:
@@ -874,36 +917,9 @@ async def _handle_systemone(raw_request: Request) -> JSONResponse:
     except ValueError as e:
         return _error(HTTPStatus.BAD_REQUEST, str(e))
 
-    # Explicit tasks (not bare coroutines) so a failing question can cancel its
-    # siblings: asyncio.gather does not do this on its own -- without it, a request
-    # that fails on question 3 of 10 leaves 4..10's engine calls running in the
-    # background for a response that has already errored out.
-    tasks = [
-        asyncio.ensure_future(
-            _answer_question(
-                name,
-                q,
-                req.state,
-                chat,
-                state.systemone_tokenizer,
-                state.systemone_served_model,
-                state.systemone_adapter_name,
-                state.systemone_renderer,
-            )
-        )
-        for name, q in req.questions.items()
-    ]
-    try:
-        results = await asyncio.gather(*tasks)
-    except BaseException:
-        # Nothing a question's own engine call raises maps to a 400 here (the only
-        # ValueErrors in this request's path -- _enforce_context_limits -- already
-        # ran and were handled above, before any task existed to cancel); whatever
-        # this is (an engine-side ErrorResponse's RuntimeError, a client disconnect's
-        # CancelledError, ...) propagates after cleanup, same as if we had not
-        # cancelled anything.
-        await _cancel_pending(tasks)
-        raise
+    results = await _run_until_disconnect(raw_request, _answer_all(state, req.state, list(req.questions.items())))
+    if results is None:
+        return Response(status_code=499)
 
     answers = {name: answer for name, answer, _ in results}
     usage = _sum_usage([question_usage for _, _, question_usage in results])
@@ -917,7 +933,7 @@ async def _handle_systemone(raw_request: Request) -> JSONResponse:
     )
 
 
-async def _handle_decisions(raw_request: Request) -> JSONResponse:
+async def _handle_decisions(raw_request: Request) -> Response:
     """POST /v1/decisions: OpenAI's Decisions wire format over the same engine path as
     /v1/systemone. The input flattens to the shared state string, the questions
     translate to the shared internal Question shape, and the answers map back -- the
@@ -969,29 +985,10 @@ async def _handle_decisions(raw_request: Request) -> JSONResponse:
     except ValueError as e:
         return _openai_error(HTTPStatus.BAD_REQUEST, str(e))
 
-    # The same explicit-task/cancel-siblings pattern as _handle_systemone (duplicated
-    # deliberately: an additive diff to the existing route beats a shared helper that
-    # changes it).
-    tasks = [
-        asyncio.ensure_future(
-            _answer_question(
-                key,
-                internal,
-                state_text,
-                chat,
-                state.systemone_tokenizer,
-                state.systemone_served_model,
-                state.systemone_adapter_name,
-                state.systemone_renderer,
-            )
-        )
-        for key, internal, _ in translated
-    ]
-    try:
-        results = await asyncio.gather(*tasks)
-    except BaseException:
-        await _cancel_pending(tasks)
-        raise
+    work = _answer_all(state, state_text, [(key, internal) for key, internal, _ in translated])
+    results = await _run_until_disconnect(raw_request, work)
+    if results is None:
+        return Response(status_code=499)
 
     answers = [
         _internal_answer_to_decisions(req.questions[int(key)], extras, answer)
