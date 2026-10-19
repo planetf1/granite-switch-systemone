@@ -483,15 +483,9 @@ def _openai_error(status: HTTPStatus, message: str, param: str | None = None, co
     )
 
 
-# --------------------------------------------------------------------------------------------
-# Context-limit guard. Approximate and an UNDER-count: it tokenizes `state` and each
-# question's `instructions` text directly, not the final chat-templated prompt (which also
-# includes the option list and template boilerplate), so it won't catch every over-limit
-# request. vLLM's own engine-level prompt-length check is the authoritative backstop (it
-# returns its own clear error either way, worded to match a benchmark harness's own
-# capacity-rejection markers -- see "maximum context length" below); this is a cheap, early,
-# jev-shaped 400 for the common case, not a replacement for that.
-# --------------------------------------------------------------------------------------------
+# Context-limit guard: counts state, instructions and options, so it rejects oversized
+# requests before any engine work. Template boilerplate is not counted; vLLM's own
+# prompt-length check is the backstop.
 
 
 def _text_of(x: Any) -> str:
@@ -523,7 +517,9 @@ def _enforce_context_limits(
     state_tokens = _count_tokens(tok, state_text)
     total = 0
     for name, q in questions.items():
-        n = state_tokens + _count_tokens(tok, _text_of(q.instructions))
+        options = q.criteria.items() if isinstance(q.criteria, dict) else enumerate(q.criteria or [])
+        option_text = "\n".join(f"{key} {_text_of(desc)}" for key, desc in options)
+        n = state_tokens + _count_tokens(tok, f"{_text_of(q.instructions)}\n{option_text}")
         if n > per_question_cap:
             raise ValueError(
                 f"question {name!r} is approximately {n} tokens, exceeding the "

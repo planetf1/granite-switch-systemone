@@ -499,3 +499,21 @@ def test_error_response_type_resolves_on_either_vllm_layout(monkeypatch, module)
         monkeypatch.setitem(sys.modules, name, fake if name == module else None)
 
     assert sp._error_response_type() is ErrorResponse
+
+
+def test_enforce_context_limits_counts_option_descriptions():
+    """Options are part of the prompt: a short state with long descriptions must not
+    slip past the guard (measured live: 20 x 255 long options prefilled 1.2M tokens)."""
+    tok = _FakeTok()
+    criteria = {f"o{i}": "lorem " * 200 for i in range(255)}
+    q = sp.Question(type="choice", instructions="Which?", criteria=criteria)
+    with pytest.raises(ValueError) as exc_info:
+        sp._enforce_context_limits(tok, 32768, False, "short state", {"q": q})
+    assert any(marker in str(exc_info.value) for marker in _CAPACITY_MARKERS)
+
+
+def test_enforce_context_limits_counts_score_level_descriptions():
+    tok = _FakeTok()
+    q = sp.Question(type="score", instructions="How?", criteria=["lorem " * 4000] * 10)
+    with pytest.raises(ValueError):
+        sp._enforce_context_limits(tok, 32768, False, "short state", {"q": q})
