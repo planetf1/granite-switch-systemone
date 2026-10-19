@@ -1,73 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""jev system-one API (`POST /v1/systemone`) and OpenAI Decisions API
-(`POST /v1/decisions`) as `vllm.endpoint_plugins` entry points, mounted on the SAME vLLM
-OpenAI server that serves `/v1/chat/completions` -- one engine, one KV cache, one
-container. Both routes are wire-format facades over one engine path: a request made
-through either renders a byte-identical prompt and reads the same label logits (the
-parity tests in `tests/test_decisions.py` assert the translation converges on exactly
-what the systemone route builds for the equivalent request).
+"""`/v1/decisions` (OpenAI) and `/v1/systemone` (jev) as vLLM endpoint plugin routes.
 
-What this is: typesafe.ai's system-one API takes an unstructured `state` and typed
-`questions` (`noul`/`choice`/`score`) and returns typed `answers` with calibrated
-probabilities. A granite-switch decision adapter can already do exactly this through
-`/v1/chat/completions` -- callers just have to hand-build the request themselves (an
-adapter-specific invocation marker, a label pool, softmax over `top_logprobs`). This
-plugin does that translation server-side so a jev-shaped caller gets a jev-shaped
-answer.
-
-ADAPTER-AGNOSTIC BY DESIGN: this module has no knowledge of any specific decision
-adapter's trained prompt convention. The one piece that does -- turning
-`(state, instructions, option descriptions)` into chat messages and label token ids
--- is resolved at import time via `SYSTEMONE_RENDERER`, a required
-`"module:function"` dotted path (default: `granite_switch_systemone.renderer:render`,
-this package's own placeholder implementation for the one adapter convention this
-repo was built against -- see that module's docstring for why it is a placeholder,
-not a permanent design). This package never imports a renderer module directly; it
-only `importlib`s whatever path is configured, so it carries no dependency (and no
-risk of a dependency cycle) on wherever a renderer's real implementation ends up
-living.
-
-Why no system prompt (the renderer's job, not this module's, but relevant to this
-module's own prefix-cache design): without it, a decision's tokens can match a
-`/v1/chat/completions` request from the start, and vLLM's prefix cache reuses blocks
-only for a match from the start -- the two "endpoints" are two pieces of Python issuing
-requests to the same AsyncLLM. That holds only for a chat with no system turn whose
-first user turn is literally `State:\\n<state>`; any other chat diverges within a few
-tokens (`tests/test_prefix_sharing.py`).
-
-How a request reaches the engine: `attach_router`/`init_state` are vLLM 0.26+'s own
-`vllm.endpoint_plugins` contract (`vllm/plugins/endpoint_plugins/interface.py`).
-`init_state` runs after vLLM's own `init_generate_state` has set
-`app.state.openai_serving_chat` (`vllm/entrypoints/openai/api_server.py::init_app_state`),
-so we reach the engine the sanctioned way:
-`openai_serving_chat.create_chat_completion(ChatCompletionRequest(...))`, the exact
-method `/v1/chat/completions`'s own route calls
-(`vllm/entrypoints/openai/chat_completion/api_router.py`). No new engine access path
-is opened.
-
-Label logprobs: `ChatCompletionRequest.logprob_token_ids` asks for exactly our label
-token ids' logprobs (no `top_logprobs`-guessing/missing-label fallback needed), and
-`return_tokens_as_token_ids=True` makes each returned token the exact string
-`"token_id:{id}"`, so matching a label back to its logprob is exact integer
-comparison, not decoded-string comparison. One sub-ULP constraint this inherits from
-vLLM itself (not a choice we made): `SamplingParams` caps `logprob_token_ids` at
-`MAX_LOGPROB_TOKEN_IDS` (128, `vllm/sampling_params.py`) -- below jev's own 255-option
-ceiling for `choice`. A `choice` with more than 128 options is handled by splitting
-its label ids into `MAX_LABEL_OPTIONS`-sized chunks and issuing one
-`create_chat_completion` call per chunk, concurrently, all for the IDENTICAL prompt
-(only `logprob_token_ids` differs per chunk) -- vLLM's own prefix cache is what makes
-the second-and-later chunks cheap. This is not opening a new engine access path
-either: every chunk still goes through the one sanctioned `create_chat_completion`
-call, just more than once per question. jev's own 255-option ceiling bounds this to
-at most `ceil(255/128) = 2` calls, never unbounded.
-
-Deliberate scope limits for this self-hosted mirror (not a proxy to typesafe.ai):
-`model` is required on the request (schema compliance) but never validated against
-anything -- the response always echoes the actually-served model name. `401`/`429`/
-`529` are not implemented (access control and rate limiting belong to whatever is
-hosting this container, not duplicated here). jev's fourth question type (`"box"`,
-bounding-box-on-an-image, gated by `TypeSafe-Danger-Zone-Images: true`) is not
-supported -- no vision capability on a decision adapter.
+Both routes validate their own wire format, translate to one internal question shape and
+answer through `openai_serving_chat.create_chat_completion`, the same engine call
+`/v1/chat/completions` uses. Each question is one exact read of its option labels'
+logprobs (`logprob_token_ids`, chunked above vLLM's 128-id cap). The adapter-specific
+prompt is built by the renderer named in `SYSTEMONE_RENDERER`.
 """
 
 from __future__ import annotations
@@ -100,18 +38,12 @@ _DEFAULT_ADAPTER_NAME = "decision"
 MAX_BODY_BYTES = 32 * 1024 * 1024
 # jev: nesting <= 64 levels anywhere in the request body.
 MAX_NESTING_DEPTH = 64
-# jev's documented context limits (tokens); the `TypeSafe-Danger-Zone-Long-Context: true`
-# header raises both to DANGER_ZONE_TOKEN_LIMIT. We additionally cap by the engine's own
-# --max-model-len, since we can't resize a running engine per request.
+# jev's context limits in tokens, raised by its long-context header; also capped by --max-model-len.
 DEFAULT_PER_QUESTION_TOKEN_LIMIT = 32_000
 DEFAULT_PER_REQUEST_TOKEN_LIMIT = 64_000
 DANGER_ZONE_TOKEN_LIMIT = 262_144
 DANGER_ZONE_HEADER = "typesafe-danger-zone-long-context"
-# vLLM's own cap on `SamplingParams.logprob_token_ids` per request
-# (vllm/sampling_params.py, MAX_LOGPROB_TOKEN_IDS) -- below jev's 255-option ceiling for
-# `choice`. Also used as our chunk size: a question needing more single-token labels than
-# this issues ceil(n / MAX_LABEL_OPTIONS) chunked requests instead of one (see
-# _fetch_label_logprobs), never silently truncated or rejected.
+# vLLM's MAX_LOGPROB_TOKEN_IDS; a choice with more labels is read in chunks of this size.
 MAX_LABEL_OPTIONS = 128
 
 
@@ -154,22 +86,11 @@ def _resolve_adapter_name(chat) -> str:
     )
 
 
-# --------------------------------------------------------------------------------------------
-# Request/response shapes (jev's system-one API, as published at docs.typesafe.ai /
-# https://api.typesafe.ai/openapi.json)
-# --------------------------------------------------------------------------------------------
+# jev's system-one request shapes (https://api.typesafe.ai/openapi.json).
 
 
 class Question(BaseModel):
-    """Mirrors jev's real OpenAPI spec (NoulQuestion/ChoiceQuestion/ScoreQuestion),
-    not just its prose docs -- the two disagree in places (e.g. the prose never
-    mentions that `instructions` is optional for every type, or that choice/score
-    each only require >=1 entry, not >=2; the real schema is authoritative). `box`
-    (bounding-box-on-an-image questions, gated by `TypeSafe-Danger-Zone-Images: true`
-    + an `assets` field) is a fourth jev question type this mirror does not support
-    -- no vision capability on a decision adapter -- so it is deliberately absent
-    from `type` and `assets` is deliberately absent from `SystemOneRequest` below; a
-    client that sends either gets a clear 422, not a silent partial answer."""
+    """One jev question, validated against jev's OpenAPI schema (`box` is not supported)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -219,31 +140,11 @@ class SystemOneRequest(BaseModel):
         return self
 
 
-# --------------------------------------------------------------------------------------------
-# Request/response shapes (OpenAI's Decisions API, `POST /v1/decisions`, public beta:
-# developers.openai.com/api/docs/guides/decisions and the openai-openai spec). A
-# wire-format facade over the same internals as /v1/systemone, so callers written
-# against OpenAI's Decisions API (official SDKs, pydantic-ai, ...) work by changing
-# base_url only. Deliberate scope limits, mirroring the systemone route's:
-# image `input` parts are rejected with a 400 (text decision adapter, the same stance
-# as jev's `box`); per-question `refusal` answers are never produced (this adapter
-# fail-closes with an error rather than refusing); error bodies follow OpenAI's
-# `{"error": {...}}` shape (the SDKs parse it on this route) instead of jev's
-# HTTPValidationError; `usage.input_tokens_details` carries vLLM's prefix-cache read
-# and write counts (0 unless the server runs with `--enable-prompt-tokens-details`);
-# only `user` messages are accepted in `input` (no system/developer/assistant turns, no
-# tool-call items), since the trained layout has no place to render them.
-# --------------------------------------------------------------------------------------------
+# OpenAI's Decisions request shapes (openai/openai-openapi, `POST /decisions`).
 
 
 def _choice_key(value: str | bool) -> str:
-    """The option key a choice value renders as: strings pass through, booleans coerce
-    to "true"/"false". OpenAI's spec types choice values as `string | boolean` and says
-    "a string and a boolean with the same text are distinct", but the trained
-    convention's option keys are plain label text, where `true` and "true" are
-    indistinguishable to the model -- so a request mixing the two is rejected (see
-    DecisionQuestion._check_type_fields) rather than answered with probabilities the
-    model cannot actually separate."""
+    """A choice value as option text; booleans become "true"/"false"."""
     return value if isinstance(value, str) else ("true" if value else "false")
 
 
@@ -351,12 +252,7 @@ class DecisionRequest(BaseModel):
         return self
 
 
-# --------------------------------------------------------------------------------------------
-# Body-level validation: jev's 400s (bad UTF-8/nesting/non-finite), 413, 415 -- none of these
-# are free in a plain FastAPI route (`request: SystemOneRequest` would 400 a schema violation
-# too, not 422 as jev's own table wants; and `json.loads` accepts NaN/Infinity by default), so
-# we read+parse the body ourselves before touching pydantic.
-# --------------------------------------------------------------------------------------------
+# Body checks before pydantic: encoding, size, UTF-8, nesting and finite numbers.
 
 
 def _check_content_headers(headers) -> tuple[int, str] | None:
@@ -427,27 +323,14 @@ def _parse_strict_json(body: bytes) -> Any:
 
 
 def _validation_error_response(e: PydanticValidationError) -> JSONResponse:
-    """jev's documented 422 body (`HTTPValidationError`, from the real OpenAPI spec --
-    its prose docs never show this shape, only the schema does):
-    `{"detail": [{"loc", "msg", "type", "input"?, "ctx"?}, ...]}`. That is pydantic's
-    own `ValidationError.errors()` shape already, apart from the extra `url` key
-    pydantic adds that jev doesn't document, so we only pass through the keys jev's
-    `ValidationError` schema actually has."""
+    """jev's 422 body: pydantic's errors with `loc` rooted at "body", limited to jev's keys."""
     detail = []
     for err in e.errors():
-        # jev's own loc examples are rooted at "body" (e.g. ["body", "state"]) --
-        # the FastAPI convention of naming the request-body parameter as the first
-        # path segment. We parse the body ourselves rather than through a FastAPI
-        # Body(...) parameter, so pydantic's own loc starts one level in; prepend
-        # "body" to match.
         item = {"loc": ["body", *err["loc"]], "msg": err["msg"], "type": err["type"]}
         if "input" in err:
             item["input"] = err["input"]
         if "ctx" in err:
-            # For a custom @model_validator's raised ValueError, pydantic puts the
-            # exception object itself (not a string) at ctx["error"] -- stringify it
-            # so the body stays JSON-serializable; everything else in ctx is already
-            # plain data.
+            # A validator's ValueError sits in ctx as an exception object.
             item["ctx"] = {k: (str(v) if isinstance(v, BaseException) else v) for k, v in err["ctx"].items()}
         detail.append(item)
     return JSONResponse(content={"detail": detail}, status_code=int(HTTPStatus.UNPROCESSABLE_ENTITY))
@@ -532,11 +415,7 @@ def _enforce_context_limits(
         )
 
 
-# --------------------------------------------------------------------------------------------
-# jev's own confidence formulas (vendored from the official
-# typesafe-ai/system-one-adapter-python `_utils/confidence_metrics.py`, not our own
-# invention) -- generic to jev's wire format, not specific to any adapter.
-# --------------------------------------------------------------------------------------------
+# jev's confidence formulas, from typesafe-ai/system-one-adapter-python.
 
 
 def _softmax(logps: list[float]) -> list[float]:
@@ -582,9 +461,7 @@ def _score_confidence(probs: list[float]) -> float:
     return max(0.0, 1.0 - distance_from_mode / uniform_mean_distance)
 
 
-# --------------------------------------------------------------------------------------------
-# One question -> one jev-shaped answer, over `/v1/chat/completions`'s own serving object.
-# --------------------------------------------------------------------------------------------
+# One question, one answer, through the chat route's serving object.
 
 
 def _chunk_label_ids(label_ids: list[int]) -> list[list[int]]:
@@ -699,11 +576,7 @@ async def _answer_question(
 
     msgs, label_ids = renderer(tok, state, q.instructions, descs)
 
-    # A choice with more than MAX_LABEL_OPTIONS options (jev allows up to 255) chunks
-    # into multiple create_chat_completion calls over the IDENTICAL prompt -- vLLM's own
-    # prefix cache, not anything this plugin does, is what makes the second-and-later
-    # chunks cheap. Fired concurrently; vLLM's scheduler decides each chunk's cache
-    # hit/miss on its own.
+    # Over 128 labels: one request per chunk, same prompt, so later chunks hit the prefix cache.
     responses = await asyncio.gather(
         *(
             _fetch_label_logprobs(chat, served_model, adapter_name, msgs, chunk)
@@ -786,12 +659,7 @@ async def _answer_all(state, state_value: Any, questions: list[tuple[str, Questi
 
 
 async def _cancel_pending(tasks: list[asyncio.Task]) -> None:
-    """Cancel every task that hasn't finished yet, then wait for the cancellation to
-    actually be processed by the event loop -- a bare `.cancel()` only *requests*
-    cancellation; a task destroyed before that request is processed can log a "Task
-    was destroyed but it is pending" warning. Safe to call with already-finished
-    tasks mixed in: cancelling a done task is a no-op, and `return_exceptions=True`
-    swallows the CancelledError the cancelled ones raise."""
+    """Cancel unfinished tasks and wait for the cancellations to land."""
     for task in tasks:
         if not task.done():
             task.cancel()
@@ -821,16 +689,7 @@ def _decisions_input_to_state(data: str | list[DecisionInputMessage]) -> str:
 
 
 def _decisions_question_to_internal(question: DecisionQuestion, index: int) -> tuple[str, Question, dict[str, Any]]:
-    """Translate one OpenAI Decisions question into the internal (jev-shaped) Question
-    both routes share, plus the metadata needed to map its answer back. The internal key
-    is always the positional index -- OpenAI's answers are positional, so duplicate or
-    missing `name`s cannot collide (the response echoes the original name or null).
-
-    Mapping: `predicate` -> noul with the trained default true/false descriptions
-    (OpenAI's predicate has no description fields); `choice` -> a criteria object keyed
-    by the coerced option keys (description optional, as in jev); `score` -> the level
-    descriptions, with a level's label standing in when it has no description (jev's
-    score criteria cannot be null)."""
+    """An OpenAI question as the internal jev question, keyed by position, plus what maps the answer back."""
     if question.type == "predicate":
         internal = Question(type="noul", instructions=question.instructions)
         extras: dict[str, Any] = {}
@@ -943,12 +802,7 @@ async def _handle_systemone(raw_request: Request) -> Response:
 
 
 async def _handle_decisions(raw_request: Request) -> Response:
-    """POST /v1/decisions: OpenAI's Decisions wire format over the same engine path as
-    /v1/systemone. The input flattens to the shared state string, the questions
-    translate to the shared internal Question shape, and the answers map back -- the
-    parity tests in tests/test_decisions.py assert the translation converges on exactly
-    what the systemone route builds for the equivalent request, so both routes render
-    byte-identical prompts and read the same label logits."""
+    """POST /v1/decisions: OpenAI's wire format over the same engine path as /v1/systemone."""
     state = raw_request.app.state
     chat = getattr(state, "systemone_chat", None)
     if chat is None:
@@ -1051,10 +905,6 @@ class SystemOnePlugin:
         app.include_router(router)
 
     async def init_state(self, engine_client: EngineClient | None, state: State, args: Namespace) -> None:
-        # `required_tasks = ("generate",)` already guarantees "generate" is supported, so
-        # `openai_serving_chat` (set by vllm's own init_generate_state, which runs before any
-        # endpoint plugin's init_state) is never None here; the getattr/None check is just
-        # defense in depth, matching the EndpointPlugin contract's own guidance.
         chat = getattr(state, "openai_serving_chat", None)
         if chat is None:
             return
@@ -1062,10 +912,7 @@ class SystemOnePlugin:
         state.systemone_tokenizer = chat.renderer.tokenizer
         state.systemone_max_model_len = chat.model_config.max_model_len
         state.systemone_served_model = args.served_model_name[0] if args.served_model_name else args.model
-        # Deliberately NOT wrapped in try/except: a mismatched adapter name, or an
-        # unresolvable renderer, must fail server startup, not be swallowed into a
-        # plugin that silently serves wrong answers for /v1/systemone's entire
-        # lifetime (see module docstring).
+        # A bad adapter name or renderer must stop the server, not serve wrong answers.
         state.systemone_adapter_name = _resolve_adapter_name(chat)
         state.systemone_renderer = _load_renderer()
 
