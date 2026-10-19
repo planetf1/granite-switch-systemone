@@ -624,6 +624,14 @@ def _chunk_usage(usage) -> TokenUsage:
     )
 
 
+class EngineError(Exception):
+    """An engine-side failure (vLLM's ErrorResponse) with the status the route returns."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status if 400 <= status < 600 else 500
+
+
 def _error_response_type() -> type:
     """vLLM's ErrorResponse, which moved from `entrypoints/openai/engine/protocol` (0.26-0.28)
     to `entrypoints/serve/engine/protocol` (0.29+); granite-switch 0.1.1 supports 0.26-0.30."""
@@ -664,7 +672,7 @@ async def _fetch_label_logprobs(
     )
     resp = await chat.create_chat_completion(req)
     if isinstance(resp, ErrorResponse):
-        raise RuntimeError(resp.error.message)
+        raise EngineError(resp.error.message, resp.error.code)
     assert isinstance(resp, ChatCompletionResponse)
     return resp
 
@@ -918,7 +926,10 @@ async def _handle_systemone(raw_request: Request) -> Response:
     except ValueError as e:
         return _error(HTTPStatus.BAD_REQUEST, str(e))
 
-    results = await _run_until_disconnect(raw_request, _answer_all(state, req.state, list(req.questions.items())))
+    try:
+        results = await _run_until_disconnect(raw_request, _answer_all(state, req.state, list(req.questions.items())))
+    except EngineError as e:
+        return _error(HTTPStatus(e.status), str(e))
     if results is None:
         return Response(status_code=499)
 
@@ -987,7 +998,10 @@ async def _handle_decisions(raw_request: Request) -> Response:
         return _openai_error(HTTPStatus.BAD_REQUEST, str(e))
 
     work = _answer_all(state, state_text, [(key, internal) for key, internal, _ in translated])
-    results = await _run_until_disconnect(raw_request, work)
+    try:
+        results = await _run_until_disconnect(raw_request, work)
+    except EngineError as e:
+        return _openai_error(HTTPStatus(e.status), str(e))
     if results is None:
         return Response(status_code=499)
 

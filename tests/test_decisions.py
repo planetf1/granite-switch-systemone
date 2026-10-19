@@ -428,3 +428,28 @@ def test_openai_error_shape():
         }
     }
     assert resp.status_code == 400
+
+
+def test_engine_error_maps_to_openai_error_shape(client, monkeypatch):
+    """An engine-side failure (vLLM ErrorResponse) must not surface as a bare 500."""
+
+    async def failing(*args):
+        raise sp.EngineError("This model's maximum context length is 8192 tokens.", 400)
+
+    monkeypatch.setattr(sp, "_answer_question", failing)
+    resp = client.post(
+        "/v1/decisions", json={"model": "m", "input": "x", "questions": [{"type": "predicate", "instructions": "q?"}]}
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["type"] == "invalid_request_error"
+    assert "maximum context length" in resp.json()["error"]["message"]
+
+
+def test_engine_error_on_systemone_route_uses_its_error_shape(client, monkeypatch):
+    async def failing(*args):
+        raise sp.EngineError("engine overloaded", 503)
+
+    monkeypatch.setattr(sp, "_answer_question", failing)
+    resp = client.post("/v1/systemone", json={"model": "m", "state": "x", "questions": {"q": {"type": "noul"}}})
+    assert resp.status_code == 503
+    assert resp.json() == {"error": {"message": "engine overloaded", "code": 503}}
