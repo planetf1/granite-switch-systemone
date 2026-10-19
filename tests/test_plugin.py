@@ -571,3 +571,10 @@ def test_choice_without_descriptions_renders_its_option_keys(monkeypatch):
     q = sp.Question(type="choice", instructions="Which?", criteria={"refund request": None, "login": "Login problems"})
     asyncio.run(sp._answer_question("q", q, "state", None, None, "m", "decision", renderer))
     assert seen["descs"] == ["refund request", "Login problems"]
+
+
+def test_parse_strict_json_rejects_lone_surrogates():
+    """JSON allows \\ud800 escapes that are not valid UTF-8 text; reject them at parse time
+    rather than letting the tokenizer fail with an internal message."""
+    with pytest.raises(ValueError, match="surrogate"):
+        sp._parse_strict_json(b'{"state": "\\ud800 x"}')

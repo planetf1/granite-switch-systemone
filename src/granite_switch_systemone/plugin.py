@@ -403,13 +403,19 @@ def _check_json_value(value: Any, depth: int = 0) -> None:
     if depth > MAX_NESTING_DEPTH:
         raise ValueError(f"request body nesting exceeds {MAX_NESTING_DEPTH} levels")
     if isinstance(value, dict):
-        for v in value.values():
+        for k, v in value.items():
+            _check_json_value(k, depth + 1)
             _check_json_value(v, depth + 1)
     elif isinstance(value, list):
         for v in value:
             _check_json_value(v, depth + 1)
     elif isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"number {value!r} is not finite")
+    elif isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as e:
+            raise ValueError("request body contains a lone surrogate escape, which is not valid text") from e
 
 
 def _parse_strict_json(body: bytes) -> Any:
