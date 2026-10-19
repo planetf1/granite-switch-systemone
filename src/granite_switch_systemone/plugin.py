@@ -618,6 +618,16 @@ def _sum_usage(usages: list[TokenUsage]) -> TokenUsage:
     return TokenUsage(*(sum(column) for column in zip(*usages))) if usages else TokenUsage(0, 0)
 
 
+def _error_response_type() -> type:
+    """vLLM's ErrorResponse, which moved from `entrypoints/openai/engine/protocol` (0.26-0.28)
+    to `entrypoints/serve/engine/protocol` (0.29+); granite-switch 0.1.1 supports 0.26-0.30."""
+    try:
+        from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+    except ImportError:
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+    return ErrorResponse
+
+
 async def _fetch_label_logprobs(
     chat,
     served_model: str,
@@ -633,8 +643,8 @@ async def _fetch_label_logprobs(
         ChatCompletionRequest,
         ChatCompletionResponse,
     )
-    from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 
+    ErrorResponse = _error_response_type()
     req = ChatCompletionRequest(
         model=served_model,
         messages=msgs,

@@ -476,3 +476,26 @@ def test_answer_question_counts_a_chunked_prompt_and_its_cache_once(
     assert usage == sp.TokenUsage(
         input_tokens=100, output_tokens=2, cached_tokens=expected_cached, cache_write_tokens=expected_written
     )
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["vllm.entrypoints.openai.engine.protocol", "vllm.entrypoints.serve.engine.protocol"],
+    ids=["vllm 0.26-0.28 layout", "vllm 0.29-0.30 layout"],
+)
+def test_error_response_type_resolves_on_either_vllm_layout(monkeypatch, module):
+    """vLLM 0.29 moved ErrorResponse out of entrypoints/openai/engine/; granite-switch
+    0.1.1 supports 0.26-0.30, so the engine call must work on both layouts."""
+    import sys
+    import types
+
+    fake = types.ModuleType(module)
+
+    class ErrorResponse:
+        pass
+
+    fake.ErrorResponse = ErrorResponse
+    for name in ("vllm.entrypoints.openai.engine.protocol", "vllm.entrypoints.serve.engine.protocol"):
+        monkeypatch.setitem(sys.modules, name, fake if name == module else None)
+
+    assert sp._error_response_type() is ErrorResponse
