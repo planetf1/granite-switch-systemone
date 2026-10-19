@@ -448,15 +448,14 @@ def _fake_chat_response(label_ids, prompt_tokens, cached_tokens, created_cache_t
 
 @pytest.mark.parametrize(
     ("first_chunk_cache", "expected_cached", "expected_written"),
-    [((40, 60), 40, 60), ((None, None), 0, 0)],
+    [((40, 60), 140, 60), ((None, None), 100, 0)],
     ids=["details reported", "details disabled"],
 )
-def test_answer_question_counts_a_chunked_prompt_and_its_cache_once(
+def test_answer_question_counts_every_chunk_of_a_chunked_prompt(
     monkeypatch, first_chunk_cache, expected_cached, expected_written
 ):
-    """A 200-option choice is two engine calls over one prompt: input and cache counts
-    come from the first chunk only (the second chunk's cache hit is the reuse chunking
-    relies on, not more input); output tokens are one per call."""
+    """A 200-option choice is two engine calls over one prompt, and usage counts both:
+    each call prefills (or reads from cache) its own copy of the prompt."""
     calls = []
 
     async def fake_fetch(chat, served_model, adapter_name, msgs, label_ids_chunk):
@@ -474,7 +473,7 @@ def test_answer_question_counts_a_chunked_prompt_and_its_cache_once(
     assert len(calls) == 2
     assert answer["type"] == "choice"
     assert usage == sp.TokenUsage(
-        input_tokens=100, output_tokens=2, cached_tokens=expected_cached, cache_write_tokens=expected_written
+        input_tokens=200, output_tokens=2, cached_tokens=expected_cached, cache_write_tokens=expected_written
     )
 
 

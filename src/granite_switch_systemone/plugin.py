@@ -614,6 +614,16 @@ def _sum_usage(usages: list[TokenUsage]) -> TokenUsage:
     return TokenUsage(*(sum(column) for column in zip(*usages))) if usages else TokenUsage(0, 0)
 
 
+def _chunk_usage(usage) -> TokenUsage:
+    details = usage.prompt_tokens_details
+    return TokenUsage(
+        input_tokens=usage.prompt_tokens,
+        output_tokens=usage.completion_tokens or 0,
+        cached_tokens=(details.cached_tokens or 0) if details else 0,
+        cache_write_tokens=(getattr(details, "created_cache_tokens", None) or 0) if details else 0,
+    )
+
+
 def _error_response_type() -> type:
     """vLLM's ErrorResponse, which moved from `entrypoints/openai/engine/protocol` (0.26-0.28)
     to `entrypoints/serve/engine/protocol` (0.29+); granite-switch 0.1.1 supports 0.26-0.30."""
@@ -699,18 +709,8 @@ async def _answer_question(
     for resp in responses:
         top_logprobs = resp.choices[0].logprobs.content[0].top_logprobs
         by_id.update({int(t.token.split(":", 1)[1]): t.logprob for t in top_logprobs})
-    # The prompt is identical across chunks (only logprob_token_ids differs), so its
-    # token and cache counts come from the first chunk alone -- summing every chunk's
-    # would multiply one question's real input by its number of chunks. Later chunks'
-    # cache hits are the reuse the chunking relies on, not extra input.
-    first = responses[0].usage
-    details = first.prompt_tokens_details
-    usage = TokenUsage(
-        input_tokens=first.prompt_tokens,
-        output_tokens=sum(resp.usage.completion_tokens or 0 for resp in responses),
-        cached_tokens=(details.cached_tokens or 0) if details else 0,
-        cache_write_tokens=(getattr(details, "created_cache_tokens", None) or 0) if details else 0,
-    )
+    # Every chunk is a separate engine request over the same prompt, so usage counts each.
+    usage = _sum_usage([_chunk_usage(resp.usage) for resp in responses])
 
     probs = _softmax([by_id[tid] for tid in label_ids])
 
