@@ -90,11 +90,14 @@ def test_boolean_choice_values_accepted():
 
 
 def test_score_bounds():
+    """OpenAPI spec: levels minItems 2, maxItems 10."""
     sp.DecisionQuestion.model_validate(_score())  # 2 levels valid
     sp.DecisionQuestion.model_validate(_score(levels=[{"label": str(i)} for i in range(10)]))  # 10 valid
-    with pytest.raises(ValidationError, match="1-10"):
+    with pytest.raises(ValidationError, match="2-10"):
+        sp.DecisionQuestion.model_validate(_score(levels=[{"label": "only"}]))
+    with pytest.raises(ValidationError, match="2-10"):
         sp.DecisionQuestion.model_validate(_score(levels=[]))
-    with pytest.raises(ValidationError, match="1-10"):
+    with pytest.raises(ValidationError, match="2-10"):
         sp.DecisionQuestion.model_validate(_score(levels=[{"label": str(i)} for i in range(11)]))
 
 

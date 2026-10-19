@@ -299,8 +299,8 @@ class DecisionQuestion(BaseModel):
         elif self.type == "score":
             if self.choices is not None:
                 raise ValueError("a `score` question takes no `choices`")
-            if not self.levels or not (1 <= len(self.levels) <= 10):
-                raise ValueError("a `score` question needs `levels` with 1-10 entries")
+            if not self.levels or not (2 <= len(self.levels) <= 10):
+                raise ValueError("a `score` question needs `levels` with 2-10 entries")
         elif self.choices is not None or self.levels is not None:
             raise ValueError("a `predicate` question takes no `choices` or `levels`")
         return self
