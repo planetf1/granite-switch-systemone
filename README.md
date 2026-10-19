@@ -175,9 +175,21 @@ Deliberate scope limits on this route:
   jev's `box`.
 - Per-question `refusal` answers are never produced: this adapter fail-closes with an
   error rather than refusing.
+- `input` messages must have role `user`. System, developer and assistant messages and
+  tool-call items are valid in OpenAI's spec but rejected with a 400: the trained layout
+  is one `State:` turn and has no place to render them.
 - Error bodies follow OpenAI's `{"error": {"message", "type", "param", "code"}}` shape (the
-  SDKs parse it on this route), not jev's `HTTPValidationError`; `usage` reports
-  input/output/total tokens without OpenAI's `*_details` breakdowns.
+  SDKs parse it on this route), not jev's `HTTPValidationError`.
+- `usage.input_tokens_details` carries vLLM's prefix-cache counts: `cached_tokens` read
+  from the cache, `cache_write_tokens` written to it. vLLM reports them only with
+  `--enable-prompt-tokens-details` (set in `serve.sh`); both are 0 without it.
+  `prompt_cache_key`, `prompt_cache_options` and per-part `prompt_cache_breakpoint` are
+  accepted and ignored, since vLLM reuses every full block of a matching prefix on its
+  own.
+
+`tests/test_openai_spec.py` validates requests and responses against OpenAI's published
+OpenAPI spec (`tests/spec/openai_decisions.json`, extracted verbatim with its source
+commit), with each limit above listed as a deliberate exception.
 - On vLLM releases that ship a native `/v1/decisions` (main after v0.32), this plugin's
   route shadows it under vLLM's documented endpoint-plugin precedence — strictly better
   here, since the native route rejects GraniteSwitch architectures.

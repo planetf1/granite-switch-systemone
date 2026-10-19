@@ -18,8 +18,9 @@ dependencies = []
 [project.optional-dependencies]
 # fastapi/pydantic are vllm's own runtime dependencies; declared here only for
 # running this package's own tests/lint outside a vLLM container (e.g. in CI).
-# httpx backs fastapi's TestClient for the route-level tests in test_decisions.py.
-dev = ["fastapi", "pydantic", "pytest", "ruff", "httpx"]
+# httpx backs fastapi's TestClient for the route-level tests in test_decisions.py;
+# jsonschema validates /v1/decisions against OpenAI's spec in test_openai_spec.py.
+dev = ["fastapi", "pydantic", "pytest", "ruff", "httpx", "jsonschema"]
 
 [project.entry-points."vllm.endpoint_plugins"]
 granite_switch_systemone = "granite_switch_systemone.plugin:register"

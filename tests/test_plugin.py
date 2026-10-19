@@ -426,3 +426,53 @@ def test_enforce_context_limits_accepts_small_request():
     tok = _FakeTok()
     q = sp.Question(type="noul", instructions="a short question")
     sp._enforce_context_limits(tok, 32768, False, "a short state", {"q": q})  # must not raise
+
+
+# --------------------------------------------------------------------------------------------
+# _answer_question's usage accounting, with create_chat_completion's responses faked.
+# --------------------------------------------------------------------------------------------
+
+
+def _fake_chat_response(label_ids, prompt_tokens, cached_tokens, created_cache_tokens):
+    from types import SimpleNamespace as NS
+
+    top = [NS(token=f"token_id:{tid}", logprob=-float(i)) for i, tid in enumerate(label_ids)]
+    details = (
+        None if cached_tokens is None else NS(cached_tokens=cached_tokens, created_cache_tokens=created_cache_tokens)
+    )
+    return NS(
+        choices=[NS(logprobs=NS(content=[NS(top_logprobs=top)]))],
+        usage=NS(prompt_tokens=prompt_tokens, completion_tokens=1, prompt_tokens_details=details),
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_chunk_cache", "expected_cached", "expected_written"),
+    [((40, 60), 40, 60), ((None, None), 0, 0)],
+    ids=["details reported", "details disabled"],
+)
+def test_answer_question_counts_a_chunked_prompt_and_its_cache_once(
+    monkeypatch, first_chunk_cache, expected_cached, expected_written
+):
+    """A 200-option choice is two engine calls over one prompt: input and cache counts
+    come from the first chunk only (the second chunk's cache hit is the reuse chunking
+    relies on, not more input); output tokens are one per call."""
+    calls = []
+
+    async def fake_fetch(chat, served_model, adapter_name, msgs, label_ids_chunk):
+        calls.append(label_ids_chunk)
+        cached, written = first_chunk_cache if len(calls) == 1 else (100, 0)
+        return _fake_chat_response(label_ids_chunk, 100, cached, written)
+
+    monkeypatch.setattr(sp, "_fetch_label_logprobs", fake_fetch)
+    criteria = {f"o{i}": f"option {i}" for i in range(200)}
+    q = sp.Question(type="choice", instructions="Which?", criteria=criteria)
+    renderer = lambda tok, state, instructions, descs: ([], list(range(1000, 1000 + len(descs))))  # noqa: E731
+
+    _, answer, usage = asyncio.run(sp._answer_question("q", q, "state", None, None, "m", "decision", renderer))
+
+    assert len(calls) == 2
+    assert answer["type"] == "choice"
+    assert usage == sp.TokenUsage(
+        input_tokens=100, output_tokens=2, cached_tokens=expected_cached, cache_write_tokens=expected_written
+    )

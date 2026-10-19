@@ -307,7 +307,7 @@ def client(monkeypatch):
                 "probabilities": {str(i): 1.0 / count for i in range(count)},
                 "confidence": 0.3,
             }
-        return name, answer, (10, 1)
+        return name, answer, sp.TokenUsage(input_tokens=10, output_tokens=1, cached_tokens=4)
 
     monkeypatch.setattr(sp, "_answer_question", fake_answer)
 
@@ -362,8 +362,14 @@ def test_decisions_route_end_to_end_with_stubbed_engine(client):
         "probability": 0.9,
     }
     assert body["answers"][2]["probabilities"][1]["label"] == "high"
-    # one stubbed engine call per question: (10, 1) each
-    assert body["usage"] == {"input_tokens": 30, "output_tokens": 3, "total_tokens": 33}
+    # one stubbed engine call per question: 10 in (4 from cache), 1 out, each
+    assert body["usage"] == {
+        "input_tokens": 30,
+        "input_tokens_details": {"cached_tokens": 12, "cache_write_tokens": 0},
+        "output_tokens": 3,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": 33,
+    }
 
 
 def test_decisions_route_validation_error_uses_openai_shape(client):

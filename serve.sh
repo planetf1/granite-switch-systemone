@@ -17,6 +17,8 @@
 set -e
 MODEL_DIR=${MODEL_DIR:-/repository}
 TP=${TENSOR_PARALLEL_SIZE:-$(python3 -c "import torch; print(max(torch.cuda.device_count(), 1))")}
+# --enable-prompt-tokens-details: vLLM reports each request's prefix-cache hits, which
+# /v1/decisions returns as usage.input_tokens_details.cached_tokens (0 without it).
 # FlashAttention 2: granite-switch's FA3 ahead-of-time schedule is sized from the model
 # config rather than the Switch's own attention layers, and CUDA-graph capture fails
 # (generative-computing/granite-switch#139, open as of this writing).
@@ -32,6 +34,7 @@ exec vllm serve "$MODEL_DIR" \
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.90}" \
     --attention-config.flash_attn_version=2 \
     --max-logprobs 256 \
+    --enable-prompt-tokens-details \
     --override-generation-config '{"temperature": 0.0}' \
     --enable-auto-tool-choice --tool-call-parser granite4 \
     "$@"

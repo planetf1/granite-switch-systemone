@@ -78,7 +78,7 @@ import json
 import math
 import os
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -238,8 +238,10 @@ class SystemOneRequest(BaseModel):
 # as jev's `box`); per-question `refusal` answers are never produced (this adapter
 # fail-closes with an error rather than refusing); error bodies follow OpenAI's
 # `{"error": {...}}` shape (the SDKs parse it on this route) instead of jev's
-# HTTPValidationError; `usage` reports input/output/total tokens without OpenAI's
-# `*_details` breakdowns.
+# HTTPValidationError; `usage.input_tokens_details` carries vLLM's prefix-cache read
+# and write counts (0 unless the server runs with `--enable-prompt-tokens-details`);
+# only `user` messages are accepted in `input` (no system/developer/assistant turns, no
+# tool-call items), since the trained layout has no place to render them.
 # --------------------------------------------------------------------------------------------
 
 
@@ -307,17 +309,28 @@ class DecisionQuestion(BaseModel):
         return self
 
 
+class DecisionCacheBreakpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["explicit"] = "explicit"
+
+
 class DecisionInputPart(BaseModel):
+    """`prompt_cache_breakpoint` is accepted and ignored: vLLM's prefix cache reuses
+    every full block of a matching prefix on its own, with no breakpoints to place."""
+
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["input_text", "input_image"]
     text: str | None = None
     image_url: str | None = None
+    prompt_cache_breakpoint: DecisionCacheBreakpoint | None = None
 
 
 class DecisionInputMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    type: Literal["message"] = "message"
     role: Literal["user"]
     content: str | list[DecisionInputPart]
 
@@ -589,6 +602,22 @@ def _chunk_label_ids(label_ids: list[int]) -> list[list[int]]:
     return [label_ids[i : i + MAX_LABEL_OPTIONS] for i in range(0, len(label_ids), MAX_LABEL_OPTIONS)]
 
 
+class TokenUsage(NamedTuple):
+    """One question's token counts. `cached_tokens` and `cache_write_tokens` are vLLM's
+    prefix-cache read and write counts for the prompt; vLLM reports them only when the
+    server runs with `--enable-prompt-tokens-details` (serve.sh sets it), and they are
+    0 otherwise."""
+
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
+
+
+def _sum_usage(usages: list[TokenUsage]) -> TokenUsage:
+    return TokenUsage(*(sum(column) for column in zip(*usages))) if usages else TokenUsage(0, 0)
+
+
 async def _fetch_label_logprobs(
     chat,
     served_model: str,
@@ -634,7 +663,7 @@ async def _answer_question(
     adapter_name: str,
     renderer,
 ) -> tuple[str, dict[str, Any], tuple[int, int]]:
-    """Returns (name, jev-shaped answer dict, (prompt_tokens, completion_tokens))."""
+    """Returns (name, jev-shaped answer dict, this question's TokenUsage)."""
     if q.type == "choice":
         keys = list(q.criteria)
         descs = [q.criteria[k] for k in keys]
@@ -661,18 +690,21 @@ async def _answer_question(
     )
 
     by_id: dict[int, float] = {}
-    prompt_tokens = 0
-    completion_tokens = 0
-    for i, resp in enumerate(responses):
+    for resp in responses:
         top_logprobs = resp.choices[0].logprobs.content[0].top_logprobs
         by_id.update({int(t.token.split(":", 1)[1]): t.logprob for t in top_logprobs})
-        # The prompt is identical across chunks (only logprob_token_ids differs), so its
-        # token count is counted once, from the first chunk -- summing every chunk's
-        # reported prompt_tokens would multiply one question's real input size by its
-        # number of chunks.
-        if i == 0:
-            prompt_tokens = resp.usage.prompt_tokens
-        completion_tokens += resp.usage.completion_tokens or 0
+    # The prompt is identical across chunks (only logprob_token_ids differs), so its
+    # token and cache counts come from the first chunk alone -- summing every chunk's
+    # would multiply one question's real input by its number of chunks. Later chunks'
+    # cache hits are the reuse the chunking relies on, not extra input.
+    first = responses[0].usage
+    details = first.prompt_tokens_details
+    usage = TokenUsage(
+        input_tokens=first.prompt_tokens,
+        output_tokens=sum(resp.usage.completion_tokens or 0 for resp in responses),
+        cached_tokens=(details.cached_tokens or 0) if details else 0,
+        cache_write_tokens=(getattr(details, "created_cache_tokens", None) or 0) if details else 0,
+    )
 
     probs = _softmax([by_id[tid] for tid in label_ids])
 
@@ -695,7 +727,7 @@ async def _answer_question(
             "confidence": _score_confidence(probs),
         }
 
-    return name, answer, (prompt_tokens, completion_tokens)
+    return name, answer, usage
 
 
 async def _cancel_pending(tasks: list[asyncio.Task]) -> None:
@@ -867,18 +899,14 @@ async def _handle_systemone(raw_request: Request) -> JSONResponse:
         await _cancel_pending(tasks)
         raise
 
-    answers: dict[str, Any] = {}
-    input_tokens = output_tokens = 0
-    for name, answer, (prompt_tokens, completion_tokens) in results:
-        answers[name] = answer
-        input_tokens += prompt_tokens
-        output_tokens += completion_tokens
+    answers = {name: answer for name, answer, _ in results}
+    usage = _sum_usage([question_usage for _, _, question_usage in results])
 
     return JSONResponse(
         content={
             "model": state.systemone_served_model,
             "answers": answers,
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "usage": {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
         }
     )
 
@@ -959,21 +987,26 @@ async def _handle_decisions(raw_request: Request) -> JSONResponse:
         await _cancel_pending(tasks)
         raise
 
-    answers: list[dict[str, Any]] = []
-    input_tokens = output_tokens = 0
-    for (_, _, extras), (key, answer, (prompt_tokens, completion_tokens)) in zip(translated, results):
-        answers.append(_internal_answer_to_decisions(req.questions[int(key)], extras, answer))
-        input_tokens += prompt_tokens
-        output_tokens += completion_tokens
+    answers = [
+        _internal_answer_to_decisions(req.questions[int(key)], extras, answer)
+        for (_, _, extras), (key, answer, _) in zip(translated, results)
+    ]
+    usage = _sum_usage([question_usage for _, _, question_usage in results])
 
     return JSONResponse(
         content={
             "model": state.systemone_served_model,
             "answers": answers,
             "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
+                "input_tokens": usage.input_tokens,
+                "input_tokens_details": {
+                    "cached_tokens": usage.cached_tokens,
+                    "cache_write_tokens": usage.cache_write_tokens,
+                },
+                "output_tokens": usage.output_tokens,
+                # A one-token label read never reasons.
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": usage.input_tokens + usage.output_tokens,
             },
         }
     )
