@@ -1,6 +1,8 @@
 # granite-switch-systemone
 
-A [jev system-one API](https://docs.typesafe.ai/api) (`POST /v1/systemone`) bridge for
+A [jev system-one API](https://docs.typesafe.ai/api) (`POST /v1/systemone`) and
+[OpenAI Decisions API](https://developers.openai.com/api/docs/guides/decisions)
+(`POST /v1/decisions`) bridge for
 [granite-switch](https://github.com/generative-computing/granite-switch)'s vLLM backend,
 mounted on the **same** server that already serves `/v1/chat/completions` — one engine, one
 GPU KV cache, one container.
@@ -12,7 +14,11 @@ granite-switch decision adapter can already do exactly this through
 adapter's trained invocation marker, a single-token label pool, a softmax over
 `top_logprobs`). This package does that translation server-side, as a
 [`vllm.endpoint_plugins`](https://github.com/vllm-project/vllm) entry point, so a
-jev-shaped caller gets a jev-shaped answer without needing to know any of that.
+jev-shaped caller gets a jev-shaped answer without needing to know any of that. The same
+bridge also speaks OpenAI's Decisions wire format on `/v1/decisions`, so callers written
+against either industry shape — the official OpenAI SDKs included — work by changing
+`base_url` only; see [examples/decisions.md](examples/decisions.md) for calls in both
+formats.
 
 ## Why this is its own repo, not part of granite-switch or mellea
 
@@ -36,8 +42,10 @@ mellea's own machinery later with no code change to the generic bridge itself (s
 
 ## Architecture
 
-- **`plugin.py`** — the generic jev-shaped request/response bridge: body validation
-  matching jev's own `HTTPValidationError` schema, context-length guarding, the
+- **`plugin.py`** — the generic request/response bridge, carrying both wire formats
+  (jev's `/v1/systemone` and OpenAI's `/v1/decisions`) over one translation to the same
+  internals: body validation matching jev's own `HTTPValidationError` schema (and
+  OpenAI's error shape on the Decisions route), context-length guarding, the
   >128-option `choice` chunking jev's ceiling needs that vLLM's own
   `logprob_token_ids` cap doesn't support in one call, jev's own `confidence` formulas,
   and the actual engine call (`openai_serving_chat.create_chat_completion`, the exact
@@ -115,7 +123,9 @@ caller written against OpenAI's Decisions API (official SDKs, pydantic-ai, ...) 
 changing `base_url` only. A request through either route renders a byte-identical prompt
 and reads the same label logits: the `/v1/decisions` translation converges on exactly the
 internal state + question objects the systemone route builds for the equivalent request,
-which is what `tests/test_decisions.py`'s parity tests assert.
+which is what `tests/test_decisions.py`'s parity tests assert. Full example calls in both
+formats (curl, the OpenAI Python SDK, and the equivalent systemone request) are in
+[examples/decisions.md](examples/decisions.md).
 
 Mapping: `input` (a string, or user messages with text parts) flattens to the shared
 `state`; `predicate` maps onto the trained true/false readout (`probability` = P(true));

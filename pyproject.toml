@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "granite-switch-systemone"
 version = "0.1.0"
-description = "A jev system-one API (/v1/systemone) bridge for granite-switch's vLLM backend, mounted alongside /v1/chat/completions on the same server."
+description = "jev system-one (/v1/systemone) and OpenAI Decisions (/v1/decisions) APIs as vLLM endpoint plugins for granite-switch, mounted alongside /v1/chat/completions on the same server."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
