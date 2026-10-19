@@ -107,6 +107,61 @@ resp = json.loads(urllib.request.urlopen(req).read())
 # resp["answers"]["escalate"] -> {"type": "noul", "noul": 0.89}
 ```
 
+## `/v1/decisions` (OpenAI's Decisions format)
+
+The same bridge also serves OpenAI's Decisions wire format (`POST /v1/decisions`, public
+beta) next to `/v1/systemone` — one engine, one adapter, both industry shapes, so a
+caller written against OpenAI's Decisions API (official SDKs, pydantic-ai, ...) works by
+changing `base_url` only. A request through either route renders a byte-identical prompt
+and reads the same label logits: the `/v1/decisions` translation converges on exactly the
+internal state + question objects the systemone route builds for the equivalent request,
+which is what `tests/test_decisions.py`'s parity tests assert.
+
+Mapping: `input` (a string, or user messages with text parts) flattens to the shared
+`state`; `predicate` maps onto the trained true/false readout (`probability` = P(true));
+`choice` maps onto the same criteria rendering — values typed `string | boolean` are
+coerced to their text form, and a request mixing boolean `true` with the string `"true"`
+is rejected, because the trained convention's option keys are plain text and the model
+cannot distinguish the two; `score` maps onto the same level readout (`score` = expected
+level, per-level `probabilities` carrying the original labels). Answers come back in
+question order, echoing each question's `name` or null.
+
+```bash
+curl http://localhost:8000/v1/decisions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "granite-switch",
+      "input": "My payouts have failed three times. The bank says everything is fine.",
+      "questions": [
+        {"type": "choice", "name": "queue",
+         "instructions": "Which team should handle this ticket?",
+         "choices": [
+           {"value": "payments", "description": "Payout failures"},
+           {"value": "account", "description": "Login issues"},
+           {"value": "other", "description": "Something else"}]},
+        {"type": "predicate", "name": "escalate",
+         "instructions": "Does this need urgent attention?"}
+      ]
+    }'
+```
+
+Response (abridged): `{"model": ..., "answers": [{"type": "choice", "name": "queue",
+"choice": "payments", "probabilities": [...], "confidence": 0.97}, {"type": "predicate",
+"name": "escalate", "probability": 0.89}], "usage": {...}}` — answers in question order.
+
+Deliberate scope limits on this route:
+
+- Image `input` parts are rejected with a 400 — text decision adapter, the same stance as
+  jev's `box`.
+- Per-question `refusal` answers are never produced: this adapter fail-closes with an
+  error rather than refusing.
+- Error bodies follow OpenAI's `{"error": {"message", "type", "param", "code"}}` shape (the
+  SDKs parse it on this route), not jev's `HTTPValidationError`; `usage` reports
+  input/output/total tokens without OpenAI's `*_details` breakdowns.
+- On vLLM releases that ship a native `/v1/decisions` (main after v0.32), this plugin's
+  route shadows it under vLLM's documented endpoint-plugin precedence — strictly better
+  here, since the native route rejects GraniteSwitch architectures.
+
 ## Deliberate scope limits (not a proxy to typesafe.ai)
 
 - `model` is required on the request (schema compliance) but never validated — the

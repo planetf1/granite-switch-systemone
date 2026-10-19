@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""jev system-one API (`POST /v1/systemone`) as a `vllm.endpoint_plugins` entry point,
-mounted on the SAME vLLM OpenAI server that serves `/v1/chat/completions` -- one
-engine, one KV cache, one container.
+"""jev system-one API (`POST /v1/systemone`) and OpenAI Decisions API
+(`POST /v1/decisions`) as `vllm.endpoint_plugins` entry points, mounted on the SAME vLLM
+OpenAI server that serves `/v1/chat/completions` -- one engine, one KV cache, one
+container. Both routes are wire-format facades over one engine path: a request made
+through either renders a byte-identical prompt and reads the same label logits (the
+parity tests in `tests/test_decisions.py` assert the translation converges on exactly
+what the systemone route builds for the equivalent request).
 
 What this is: typesafe.ai's system-one API takes an unstructured `state` and typed
 `questions` (`noul`/`choice`/`score`) and returns typed `answers` with calibrated
@@ -224,6 +228,125 @@ class SystemOneRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------------------------
+# Request/response shapes (OpenAI's Decisions API, `POST /v1/decisions`, public beta:
+# developers.openai.com/api/docs/guides/decisions and the openai-openai spec). A
+# wire-format facade over the same internals as /v1/systemone, so callers written
+# against OpenAI's Decisions API (official SDKs, pydantic-ai, ...) work by changing
+# base_url only. Deliberate scope limits, mirroring the systemone route's:
+# image `input` parts are rejected with a 400 (text decision adapter, the same stance
+# as jev's `box`); per-question `refusal` answers are never produced (this adapter
+# fail-closes with an error rather than refusing); error bodies follow OpenAI's
+# `{"error": {...}}` shape (the SDKs parse it on this route) instead of jev's
+# HTTPValidationError; `usage` reports input/output/total tokens without OpenAI's
+# `*_details` breakdowns.
+# --------------------------------------------------------------------------------------------
+
+
+def _choice_key(value: str | bool) -> str:
+    """The option key a choice value renders as: strings pass through, booleans coerce
+    to "true"/"false". OpenAI's spec types choice values as `string | boolean` and says
+    "a string and a boolean with the same text are distinct", but the trained
+    convention's option keys are plain label text, where `true` and "true" are
+    indistinguishable to the model -- so a request mixing the two is rejected (see
+    DecisionQuestion._check_type_fields) rather than answered with probabilities the
+    model cannot actually separate."""
+    return value if isinstance(value, str) else ("true" if value else "false")
+
+
+class DecisionChoice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    value: str | bool
+    description: str | None = None
+
+
+class DecisionLevel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    description: str | None = None
+
+
+class DecisionQuestion(BaseModel):
+    """One OpenAI Decisions question (`predicate`/`choice`/`score`), with the field
+    constraints of OpenAI's published spec: `instructions` required, 2-255 unique
+    choices, at most 10 score levels. `name` is optional -- answers are positional, so
+    duplicate or missing names cannot collide (the response echoes the name or null)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["predicate", "choice", "score"]
+    instructions: str
+    name: str | None = None
+    choices: list[DecisionChoice] | None = None
+    levels: list[DecisionLevel] | None = None
+
+    @model_validator(mode="after")
+    def _check_type_fields(self) -> DecisionQuestion:
+        if self.type == "choice":
+            if self.levels is not None:
+                raise ValueError("a `choice` question takes no `levels`")
+            if not self.choices or not (2 <= len(self.choices) <= 255):
+                raise ValueError("a `choice` question needs `choices` with 2-255 entries")
+            values = [c.value for c in self.choices]
+            if len({repr(v) for v in values}) != len(values):
+                raise ValueError("choice values must be unique")
+            if len({_choice_key(v) for v in values}) != len(values):
+                raise ValueError(
+                    "boolean and string choice values with the same text are distinct in "
+                    "OpenAI's spec but indistinguishable to the model; use one or the other"
+                )
+        elif self.type == "score":
+            if self.choices is not None:
+                raise ValueError("a `score` question takes no `choices`")
+            if not self.levels or not (1 <= len(self.levels) <= 10):
+                raise ValueError("a `score` question needs `levels` with 1-10 entries")
+        elif self.choices is not None or self.levels is not None:
+            raise ValueError("a `predicate` question takes no `choices` or `levels`")
+        return self
+
+
+class DecisionInputPart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["input_text", "input_image"]
+    text: str | None = None
+    image_url: str | None = None
+
+
+class DecisionInputMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user"]
+    content: str | list[DecisionInputPart]
+
+
+class DecisionRequest(BaseModel):
+    """OpenAI's Decisions request body. `prompt_cache_key`/`prompt_cache_options`/
+    `safety_identifier` are accepted (the official SDKs send them) and ignored -- the
+    engine's prefix cache is shared automatically, and access control belongs to
+    whatever hosts this container, the same stance as the systemone route's 401/429."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    input: str | list[DecisionInputMessage]
+    questions: list[DecisionQuestion]
+
+    prompt_cache_key: str | None = None
+    prompt_cache_options: Any = None
+    safety_identifier: str | None = None
+
+    @model_validator(mode="after")
+    def _check_questions(self) -> DecisionRequest:
+        # OpenAI: "Ask 1-200 questions about the input. ... Answers come back in the
+        # same order."
+        if not (1 <= len(self.questions) <= 200):
+            raise ValueError("`questions` must contain 1-200 entries")
+        return self
+
+
+# --------------------------------------------------------------------------------------------
 # Body-level validation: jev's 400s (bad UTF-8/nesting/non-finite), 413, 415 -- none of these
 # are free in a plain FastAPI route (`request: SystemOneRequest` would 400 a schema violation
 # too, not 422 as jev's own table wants; and `json.loads` accepts NaN/Infinity by default), so
@@ -325,6 +448,23 @@ def _error(status: HTTPStatus, message: str) -> JSONResponse:
     `_validation_error_response` for 422 itself."""
     return JSONResponse(
         content={"error": {"message": message, "code": int(status)}},
+        status_code=int(status),
+    )
+
+
+def _openai_error(status: HTTPStatus, message: str, param: str | None = None, code: str | None = None) -> JSONResponse:
+    """OpenAI's documented error body for the /v1/decisions route
+    (`{"error": {"message", "type", "param", "code"}}`): the official SDKs parse
+    this shape on this route, which is the point of speaking it."""
+    return JSONResponse(
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": param,
+                "code": code,
+            }
+        },
         status_code=int(status),
     )
 
@@ -570,6 +710,94 @@ async def _cancel_pending(tasks: list[asyncio.Task]) -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _decisions_input_to_state(data: str | list[DecisionInputMessage]) -> str:
+    """Flatten OpenAI's `input` (a string, or user messages whose content is a string
+    or text/image parts) into the state string both routes share: message texts joined
+    with blank lines, the same flattening LiteLLM uses when translating between the two
+    formats. Image parts are rejected with a clear error -- this is a text decision
+    adapter, the same stance as the systemone route's `box`."""
+    if isinstance(data, str):
+        return data
+    texts: list[str] = []
+    for message in data:
+        if isinstance(message.content, str):
+            texts.append(message.content)
+            continue
+        for part in message.content:
+            if part.type == "input_image":
+                raise ValueError("image input is not supported: this server serves a text decision adapter")
+            if part.text is None:
+                raise ValueError("an `input_text` part needs a `text` string")
+            texts.append(part.text)
+    return "\n\n".join(texts)
+
+
+def _decisions_question_to_internal(question: DecisionQuestion, index: int) -> tuple[str, Question, dict[str, Any]]:
+    """Translate one OpenAI Decisions question into the internal (jev-shaped) Question
+    both routes share, plus the metadata needed to map its answer back. The internal key
+    is always the positional index -- OpenAI's answers are positional, so duplicate or
+    missing `name`s cannot collide (the response echoes the original name or null).
+
+    Mapping: `predicate` -> noul with the trained default true/false descriptions
+    (OpenAI's predicate has no description fields); `choice` -> a criteria object keyed
+    by the coerced option keys (description optional, as in jev); `score` -> the level
+    descriptions, with a level's label standing in when it has no description (jev's
+    score criteria cannot be null)."""
+    if question.type == "predicate":
+        internal = Question(type="noul", instructions=question.instructions)
+        extras: dict[str, Any] = {}
+    elif question.type == "choice":
+        criteria = {_choice_key(c.value): c.description for c in question.choices}
+        internal = Question(type="choice", instructions=question.instructions, criteria=criteria)
+        extras = {"value_map": {_choice_key(c.value): c.value for c in question.choices}}
+    else:
+        descriptions = [
+            level.description if level.description is not None else level.label for level in question.levels
+        ]
+        internal = Question(type="score", instructions=question.instructions, criteria=descriptions)
+        extras = {"labels": [level.label for level in question.levels]}
+    return str(index), internal, extras
+
+
+def _internal_answer_to_decisions(
+    question: DecisionQuestion, extras: dict[str, Any], answer: dict[str, Any]
+) -> dict[str, Any]:
+    """Map one internal (jev-shaped) answer onto OpenAI's Decisions answer shapes:
+    `predicate` -> `probability` (the internal noul answer is already P(true));
+    `choice` -> the picked value plus per-value probabilities and the shared confidence
+    statistic; `score` -> the expected level over per-level probabilities, carrying the
+    ORIGINAL level labels (the internal legend holds the descriptions we rendered)."""
+    if question.type == "predicate":
+        return {"type": "predicate", "name": question.name, "probability": answer["noul"]}
+    if question.type == "choice":
+        value_map: dict[str, str | bool] = extras["value_map"]
+        return {
+            "type": "choice",
+            "name": question.name,
+            "choice": value_map[answer["choice"]],
+            "probabilities": [
+                {"value": value_map[key], "probability": probability}
+                for key, probability in answer["probabilities"].items()
+            ],
+            "confidence": answer["confidence"],
+        }
+    labels: list[str] = extras["labels"]
+    return {
+        "type": "score",
+        "name": question.name,
+        "score": answer["score"],
+        "probabilities": [
+            {
+                "value": index,
+                "label": labels[index],
+                "probability": answer["probabilities"][str(index)],
+            }
+            for index in range(len(labels))
+        ],
+        "confidence": answer["confidence"],
+    }
+
+
 async def _handle_systemone(raw_request: Request) -> JSONResponse:
     state = raw_request.app.state
     chat = getattr(state, "systemone_chat", None)
@@ -654,12 +882,113 @@ async def _handle_systemone(raw_request: Request) -> JSONResponse:
     )
 
 
+async def _handle_decisions(raw_request: Request) -> JSONResponse:
+    """POST /v1/decisions: OpenAI's Decisions wire format over the same engine path as
+    /v1/systemone. The input flattens to the shared state string, the questions
+    translate to the shared internal Question shape, and the answers map back -- the
+    parity tests in tests/test_decisions.py assert the translation converges on exactly
+    what the systemone route builds for the equivalent request, so both routes render
+    byte-identical prompts and read the same label logits."""
+    state = raw_request.app.state
+    chat = getattr(state, "systemone_chat", None)
+    if chat is None:
+        return _openai_error(HTTPStatus.NOT_IMPLEMENTED, "the model does not support generation")
+
+    header_check = _check_content_headers(raw_request.headers)
+    if header_check is not None:
+        code, msg = header_check
+        return _openai_error(HTTPStatus(code), msg)
+
+    body = await raw_request.body()
+    if len(body) > MAX_BODY_BYTES:
+        return _openai_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, f"request body exceeds {MAX_BODY_BYTES} bytes")
+
+    try:
+        data = _parse_strict_json(body)
+    except ValueError as e:
+        return _openai_error(HTTPStatus.BAD_REQUEST, str(e))
+
+    try:
+        req = DecisionRequest.model_validate(data)
+    except PydanticValidationError as e:
+        return _openai_error(
+            HTTPStatus.BAD_REQUEST,
+            "; ".join(f"{'.'.join(str(loc) for loc in err['loc']) or 'request'}: {err['msg']}" for err in e.errors()),
+        )
+
+    try:
+        state_text = _decisions_input_to_state(req.input)
+    except ValueError as e:
+        return _openai_error(HTTPStatus.BAD_REQUEST, str(e))
+
+    translated = [_decisions_question_to_internal(question, index) for index, question in enumerate(req.questions)]
+
+    try:
+        _enforce_context_limits(
+            state.systemone_tokenizer,
+            state.systemone_max_model_len,
+            False,  # no danger-zone concept on the OpenAI route
+            state_text,
+            {key: internal for key, internal, _ in translated},
+        )
+    except ValueError as e:
+        return _openai_error(HTTPStatus.BAD_REQUEST, str(e))
+
+    # The same explicit-task/cancel-siblings pattern as _handle_systemone (duplicated
+    # deliberately: an additive diff to the existing route beats a shared helper that
+    # changes it).
+    tasks = [
+        asyncio.ensure_future(
+            _answer_question(
+                key,
+                internal,
+                state_text,
+                chat,
+                state.systemone_tokenizer,
+                state.systemone_served_model,
+                state.systemone_adapter_name,
+                state.systemone_renderer,
+            )
+        )
+        for key, internal, _ in translated
+    ]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        await _cancel_pending(tasks)
+        raise
+
+    answers: list[dict[str, Any]] = []
+    input_tokens = output_tokens = 0
+    for (_, _, extras), (key, answer, (prompt_tokens, completion_tokens)) in zip(translated, results):
+        answers.append(_internal_answer_to_decisions(req.questions[int(key)], extras, answer))
+        input_tokens += prompt_tokens
+        output_tokens += completion_tokens
+
+    return JSONResponse(
+        content={
+            "model": state.systemone_served_model,
+            "answers": answers,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+        }
+    )
+
+
 router = APIRouter()
 
 
 @router.post("/v1/systemone")
 async def create_systemone(raw_request: Request) -> JSONResponse:
     return await _handle_systemone(raw_request)
+
+
+@router.post("/v1/decisions")
+async def create_decisions(raw_request: Request) -> JSONResponse:
+    return await _handle_decisions(raw_request)
 
 
 class SystemOnePlugin:
