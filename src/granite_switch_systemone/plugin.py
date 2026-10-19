@@ -28,11 +28,12 @@ risk of a dependency cycle) on wherever a renderer's real implementation ends up
 living.
 
 Why no system prompt (the renderer's job, not this module's, but relevant to this
-module's own prefix-cache design): dropping it makes the state turn's tokens IDENTICAL
-to a `/v1/chat/completions` conversation about the same state (that call keeps its own
-system prompt, if any, in a DIFFERENT turn before it). Token-identical prefixes are
-automatically shared by vLLM's prefix cache -- the two "endpoints" are two pieces of
-Python issuing requests to the same AsyncLLM.
+module's own prefix-cache design): without it, a decision's tokens can match a
+`/v1/chat/completions` request from the start, and vLLM's prefix cache reuses blocks
+only for a match from the start -- the two "endpoints" are two pieces of Python issuing
+requests to the same AsyncLLM. That holds only for a chat with no system turn whose
+first user turn is literally `State:\\n<state>`; any other chat diverges within a few
+tokens (`tests/test_prefix_sharing.py`).
 
 How a request reaches the engine: `attach_router`/`init_state` are vLLM 0.26+'s own
 `vllm.endpoint_plugins` contract (`vllm/plugins/endpoint_plugins/interface.py`).

@@ -62,12 +62,18 @@ mellea's own machinery later with no code change to the generic bridge itself (s
 
 ## Why there's no system prompt in the rendered request
 
-Dropping the system prompt makes the state turn's tokens byte-identical to what a
-`/v1/chat/completions` conversation about the same state renders for its own first user
-turn (that call keeps its own system prompt, if any, in a *different*, later turn).
-Token-identical prefixes are automatically shared by vLLM's prefix cache — a chat
-conversation and a `/v1/systemone` decision about the same state reuse each other's
-cached prefix, because underneath both are just requests to the same engine.
+Dropping the system prompt lets a decision share vLLM's prefix cache with a
+`/v1/chat/completions` request, but only when that chat's tokens match from the very
+start. The cache reuses a block only when every token before it matches, so the chat
+must open with no system turn and its first user turn must be literally
+`State:\n<state>`. A chat that has its own system prompt, or that sends the state
+without the `State:` prefix, diverges within the first few tokens and shares nothing.
+Decisions about the same state always share the state turn with each other, which is
+what makes multi-question requests and chunked large `choice`s cheap.
+
+`tests/test_prefix_sharing.py` pins these cases against the real tokenizer and chat
+template, and `scripts/e2e_check.py`'s `prefix_cache` check measures the hits on a live
+server.
 
 ## Configuration
 
@@ -180,15 +186,17 @@ Deliberate scope limits on this route:
 
 `scripts/e2e_check.py` runs the full wire-format battery against any deployment of this
 container — both routes' answer shapes, cross-route parity, input flattening, boolean
-value round-tripping, error shapes, usage, and that `/v1/chat/completions` still works
-on the shared server. It uses only the Python standard library, so it runs wherever
+value round-tripping, error shapes, usage, that `/v1/chat/completions` still works
+on the shared server, and prefix-cache hits between chat and decisions (read from
+vLLM's `/metrics`; run it on a server with no other traffic). It uses only the Python standard library, so it runs wherever
 Python does:
 
 ```bash
 python3 scripts/e2e_check.py --base-url http://localhost:8000
 ```
 
-Pass `--model` to skip model discovery, `--skip-chat` on servers without chat, and
+Pass `--model` to skip model discovery, `--skip-chat` on servers without chat,
+`--skip-prefix-cache` to skip the cache check, and
 `--tolerance` to loosen the cross-route parity bound (default 1e-6; the two routes
 render byte-identical prompts, but GPU batching can shift low-order bits between
 separate requests). Exit code 0 means every check passed.
