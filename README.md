@@ -199,8 +199,11 @@ commit), with each limit above listed as a deliberate exception.
 `scripts/e2e_check.py` runs the full wire-format battery against any deployment of this
 container — both routes' answer shapes, cross-route parity, input flattening, boolean
 value round-tripping, error shapes, usage, that `/v1/chat/completions` still works
-on the shared server, and prefix-cache hits between chat and decisions (read from
-vLLM's `/metrics`; run it on a server with no other traffic). It uses only the Python standard library, so it runs wherever
+on the shared server, and prefix-cache hits between chat and decisions. The cache check
+reads each decision's `usage.input_tokens_details.cached_tokens` (the server needs
+`--enable-prompt-tokens-details`, which `serve.sh` sets) and cross-checks it against
+vLLM's `/metrics` counters, which are server-wide, so run it on a server with no other
+traffic. It uses only the Python standard library, so it runs wherever
 Python does:
 
 ```bash

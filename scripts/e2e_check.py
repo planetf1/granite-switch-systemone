@@ -27,12 +27,16 @@ Exit code 0 means every check passed. Checks:
                       systemone route
   chat                /v1/chat/completions still works on the shared server
                       (skip with --skip-chat)
-  prefix_cache        vLLM's prefix-cache hit counter (GET /metrics) for a
-                      decision after a chat or a decision about the same
-                      state: hits when the chat's first turn is the
-                      `State:` turn and for a second decision, none when the
-                      chat sends the raw state (skip with --skip-prefix-cache;
-                      also skipped with --skip-chat). The counters are
+  prefix_cache        prefix-cache hits for a decision after a chat or a
+                      decision about the same state, read from the decision's
+                      usage.input_tokens_details.cached_tokens (needs vLLM's
+                      --enable-prompt-tokens-details) and cross-checked
+                      against GET /metrics: hits when the chat's first turn is
+                      the `State:` turn and for a second decision, none when
+                      the chat sends the raw state; also reports, without
+                      asserting, the hits between two questions sent in one
+                      request (skip with --skip-prefix-cache; also skipped
+                      with --skip-chat). The /metrics counters are
                       server-wide, so run it on a server with no other
                       traffic.
 
@@ -383,54 +387,72 @@ def prefix_cache_counters(client: Client) -> dict[str, float] | None:
     return totals if found else None
 
 
-def cache_hits(client: Client, path: str, body: dict) -> tuple[float | None, dict]:
-    """POST one request and return the prefix-cache hit tokens it added, with its body.
-    The engine reports stats on its own loop, which can trail the HTTP response, so poll
-    until the query counter moves. None means it never moved: prefix caching is off."""
+def post_counted(client: Client, path: str, body: dict) -> tuple[dict, float | None]:
+    """POST one request; return its body and the prefix-cache hit tokens /metrics
+    attributes to it (None without counters). Engine stats can trail the HTTP response,
+    so poll until the query counter moves before reading the hits."""
     before = prefix_cache_counters(client)
     _, response = client.post(path, body)
+    if before is None:
+        return response, None
     for _ in range(50):
         after = prefix_cache_counters(client)
-        if before is not None and after is not None and after["queries"] > before["queries"]:
-            return after["hits"] - before["hits"], response
+        if after is not None and after["queries"] > before["queries"]:
+            return response, after["hits"] - before["hits"]
         time.sleep(0.1)
-    return None, response
+    return response, None
 
 
 def check_prefix_cache(client: Client, model: str) -> Check:
+    """Primary measure: the decision's own usage.input_tokens_details.cached_tokens,
+    which vLLM reports per request with --enable-prompt-tokens-details. Cross-check:
+    the /metrics hit counter for the same request, when exposed."""
     check = Check("prefix_cache")
-    if prefix_cache_counters(client) is None:
-        check.expect(False, "GET /metrics has no vllm:prefix_cache_* counters (log stats disabled?)")
-        return check
+    metrics = prefix_cache_counters(client) is not None
+    if not metrics:
+        check.notes.append("no vllm:prefix_cache_* counters on /metrics; cross-check skipped")
 
     def state() -> str:
         # A fresh state per probe, unique from its first block, so no earlier request
         # (this run's or a previous one's) can supply a hit.
         return f"Ticket {uuid.uuid4().hex}. " + TICKET * 6
 
-    def decision(text: str, question: str) -> dict:
+    def decision(text: str, *questions: str) -> dict:
         return {
             "model": model,
             "input": text,
-            "questions": [{"type": "predicate", "name": "q", "instructions": question}],
+            "questions": [{"type": "predicate", "name": f"q{i}", "instructions": q} for i, q in enumerate(questions)],
         }
 
     def chat(messages: list[dict]) -> dict:
         return {"model": model, "messages": messages, "max_tokens": 1}
 
+    def cached_tokens(response: dict) -> tuple[int, int]:
+        usage = response.get("usage", {})
+        return usage.get("input_tokens_details", {}).get("cached_tokens", 0), usage.get("input_tokens", 0)
+
+    hits_seen: list[int] = []
+
     def probe(label: str, setup: tuple[str, dict], text: str, expect_hits: bool) -> None:
-        cache_hits(client, *setup)
-        hits, response = cache_hits(client, "/v1/decisions", decision(text, "Does this need urgent attention?"))
-        if hits is None:
-            check.expect(False, f"{label}: prefix-cache query counter never moved (prefix caching disabled?)")
-            return
-        prompt = response.get("usage", {}).get("input_tokens", 0)
-        check.notes.append(f"{label}: {hits:.0f} of {prompt} decision prompt tokens from cache")
+        post_counted(client, *setup)
+        response, metric_hits = post_counted(
+            client, "/v1/decisions", decision(text, "Does this need urgent attention?")
+        )
+        cached, prompt = cached_tokens(response)
+        hits_seen.append(cached)
+        note = f"{label}: {cached} of {prompt} decision prompt tokens from cache"
+        if metric_hits is not None:
+            note += f" (/metrics: {metric_hits:.0f})"
+            # Server-wide counters: equal only when nothing else is running.
+            check.expect(
+                metric_hits == cached, f"{label}: cached_tokens {cached} but /metrics counted {metric_hits:.0f}"
+            )
+        check.notes.append(note)
         if expect_hits:
             # The state turn is most of the decision prompt; the decision turn is the rest.
-            check.expect(hits >= prompt / 2, f"{label}: expected at least half the prompt from cache")
+            check.expect(cached >= prompt / 2, f"{label}: expected at least half the prompt from cache")
         else:
-            check.expect(hits == 0, f"{label}: expected no full block in common")
+            check.expect(cached == 0, f"{label}: expected no full block in common")
 
     text = state()
     probe(
@@ -450,6 +472,18 @@ def check_prefix_cache(client: Client, model: str) -> Check:
     text = state()
     raw = [{"role": "user", "content": text}]
     probe("after a chat sending the raw state", ("/v1/chat/completions", chat(raw)), text, False)
+
+    if not any(hits_seen) and check.failures:
+        check.failures.append(
+            "no decision reported any cached_tokens: is the server missing --enable-prompt-tokens-details, "
+            "or running with prefix caching off?"
+        )
+
+    # Informational: the plugin sends one request's questions to the engine together, and
+    # whether they share the state turn depends on the scheduler, not on the tokens.
+    response, _ = post_counted(client, "/v1/decisions", decision(state(), "Is it urgent?", "Is the customer angry?"))
+    cached, prompt = cached_tokens(response)
+    check.notes.append(f"two questions in one fresh request: {cached} of {prompt} prompt tokens from cache")
     return check
 
 
