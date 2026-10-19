@@ -73,6 +73,25 @@ def text_of(x: object) -> str:
     return "" if x is None else str(x)
 
 
+# U+2060 WORD JOINER: invisible, and splits a special-token string so the tokenizer
+# reads it as text rather than as the special token.
+TOKEN_BREAK = "⁠"
+
+
+def escape_special_tokens(text: str, specials: list[str]) -> str:
+    """Break every occurrence of the tokenizer's added tokens in caller text, so state,
+    instructions and descriptions cannot forge turns or a second adapter activation."""
+    for special in specials:
+        if special in text:
+            text = text.replace(special, special[0] + TOKEN_BREAK + special[1:])
+    return text
+
+
+def _specials(tok) -> list[str]:
+    added = getattr(tok, "get_added_vocab", None)
+    return sorted(added(), key=len, reverse=True) if added else []
+
+
 def build_label_pool(tok, need: int) -> list[tuple[str, int]]:
     """`need` single-token labels: A..Z first (readable), then digits, then any
     other two-letter combination, so wide (>26-option) `choice` questions still get
@@ -119,15 +138,18 @@ def render(
         in the same order.
     """
     labels = build_label_pool(tok, len(descriptions))
+    marker = _invocation_marker()
+    # The chat template activates at the turn's last marker, so caller text must not carry one.
+    specials = [*_specials(tok), marker]
     ctx = text_of(state) if state not in ("", None, {}, []) else "(empty)"
-    q_lines = ["Question:", text_of(instructions), "", "Options:"]
+    q_lines = ["Question:", escape_special_tokens(text_of(instructions), specials), "", "Options:"]
     for (label, _), description in zip(labels, descriptions):
         desc_text = text_of(description) if description not in (None, "") else label
-        q_lines.append(f"{label}: {desc_text}")
+        q_lines.append(f"{label}: {escape_special_tokens(desc_text, specials)}")
     q_lines += ["", "Reply with exactly one option label."]
-    second_turn = _invocation_marker() + "\n" + "\n".join(q_lines)
+    second_turn = marker + "\n" + "\n".join(q_lines)
     messages = [
-        {"role": "user", "content": "State:\n" + ctx},
+        {"role": "user", "content": "State:\n" + escape_special_tokens(ctx, specials)},
         {"role": "user", "content": second_turn},
     ]
     return messages, [token_id for _, token_id in labels]
