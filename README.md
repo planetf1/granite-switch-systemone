@@ -71,6 +71,10 @@ cached prefix, because underneath both are just requests to the same engine.
 
 ## Configuration
 
+These configure the shared engine path — adapter activation, prompt rendering, plugin
+loading — so they govern both `/v1/systemone` and `/v1/decisions`; there is nothing
+to configure per route.
+
 | Env var | Required? | What it does |
 |---|---|---|
 | `SYSTEMONE_ADAPTER_NAME` | Only if the checkpoint has more than one adapter | Which `adapter_name` activates the decision adapter. Auto-resolved if the checkpoint has exactly one adapter; cross-checked against the checkpoint's real `GraniteSwitchConfig.adapter_names` either way, raising at server startup (not silently) on a mismatch. |
